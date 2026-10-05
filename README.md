@@ -156,6 +156,10 @@ python3 coordination/test_swarm_coordination.py
 ```
 
 ### Metrics & validation
+The live metrics (`/swarm/metrics/coverage_pct`, `/swarm/metrics/overlap_rate`, RTF) are measured. The
+offline scripts below are **placeholders**: `parse_rosbag.py` does not read the bag yet (it writes
+synthetic trajectories), and `validate.py` plots hard-coded coverage/overlap/speedup values. Don't cite
+their numbers until they are rebuilt (see [mdFiles/evaluation.md](mdFiles/evaluation.md)).
 ```bash
 python3 validation/parse_rosbag.py --name <path_to_bag>
 ```
@@ -166,8 +170,8 @@ python3 validation/validate.py --dir validation/output
 ### Known limitations
 - **Speed on a laptop:** under WSL2 the full stack runs at about 0.6–0.75× real time, limited by
   software rendering of the depth cameras. All nodes use simulation time, so behaviour is unchanged and
-  only wall-clock speed is affected. On a native Linux host with an NVIDIA GPU it runs in real time
-  (see `docker/sim`).
+  only wall-clock speed is affected. A native Linux host with an NVIDIA GPU (see `docker/sim`) is
+  expected to run in real time, but this has not been measured yet.
 - **Overlap:** the 87° / 8 m depth cameras see a large part of a 24 × 20 m room from almost anywhere, so
   cells seen by two drones are common (about 30–45 % by the time coverage reaches 90 %). Algorithm 1 and
   gain discounting keep the drones' *targets and paths* apart, which is what the 2 m exclusion zones

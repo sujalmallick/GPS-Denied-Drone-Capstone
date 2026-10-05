@@ -1,184 +1,111 @@
-# GPS-Denied Autonomous Drone Exploration (Software-Only Simulation)
+# GPS-Denied Multi-Drone Swarm Exploration: Documentation Index
+
+Design and reference docs for the three-drone indoor exploration swarm. The repository root
+[`../README.md`](../README.md) is the authoritative quick start (topics, rates, algorithms, launch
+arguments, known limitations). The files in this folder explain the design behind it.
+
+Repository: <https://github.com/sujalmallick/GPS-Denied-Drone-Capstone>
 
 ## Project Objective
 
-Build a **single simulated drone** that can autonomously explore an unknown,
-GPS-denied environment: build a map as it flies, detect unexplored regions,
-choose where to go next, generate waypoints, and fly there — repeating until
-the environment is sufficiently explored. Everything runs in simulation.
-There is no physical hardware in this project.
+Three simulated quadrotors (`drone_1`, `drone_2`, `drone_3`) explore an unknown, walled indoor
+arena together: each drone maps what its own depth camera sees, the maps are fused into one
+global occupancy grid, and a central allocator sends each drone to a different frontier so the
+swarm covers the space without duplicating effort. Everything runs in simulation (Gazebo Harmonic
++ ROS 2 Jazzy). There is no physical hardware in the running system.
 
 ## Problem Statement
 
-Traditional drone navigation relies on GPS for localization. GPS is
-unavailable or unreliable indoors, in urban canyons, underground, and in many
-disaster-response scenarios. A GPS-denied autonomy stack must localize itself
-using onboard sensors (camera + IMU) and must decide where to explore next
-using only what it has already observed (an occupancy map), not any
-externally supplied position or pre-built map.
+Outdoor drones localize with GPS. Indoors, underground, in urban canyons and in collapsed
+buildings the satellite signal is blocked, reflected or jammed, so position from GPS is missing or
+wrong. A GPS-denied drone has to rely on what it carries: it must sense obstacles with onboard
+sensors (depth camera, IMU), build its own map, and decide where to go next using only what it has
+observed, without a pre-built map or an external position fix.
 
-This project builds and validates such a stack, entirely in simulation,
-starting from a single drone.
+A single drone doing this is slow, limited by battery, and a single point of failure. A swarm can
+split the work, but only if the drones share what they have mapped and avoid exploring the same
+space. That coordination problem (map merging plus no-overlap frontier allocation) is the core of
+this project.
 
-## Software-Only Scope
+## Current System (what runs today)
 
-* **No hardware** is designed, targeted, or assumed at any point in Phase 1.
-* **No Jetson Orin Nano or any embedded deployment target.** Any reference to
-  onboard compute in a hypothetical future phase is explicitly out of scope
-  here.
-* Everything runs on a development workstation using Gazebo, PX4 SITL, and
-  ROS 2.
-* The deliverable is a working simulation stack plus the autonomy code that
-  could later be ported to hardware — porting itself is not part of Phase 1.
+| Layer | Implementation |
+|---|---|
+| Simulator | Gazebo Harmonic (gz-sim 8), DART physics, 2 ms step; `simulation/worlds/simple_world.sdf`, a walled 24 m × 20 m arena with partitions, boxes and pillars |
+| Vehicles | 3 × `simulation/models/quadrotor_px4.sdf`: rotor physics (`MulticopterMotorModel` per propeller) flown by Gazebo's `MulticopterVelocityControl`. **Not PX4.** |
+| Sensors | Forward depth camera (87° HFOV, 0.1–20 m), 640×480 RGB camera, 200 Hz IMU with noise and bias, 30 Hz odometry |
+| Middleware | ROS 2 Jazzy, `ros_gz_bridge`, `coordination/clock_relay.py` (`/clock` at 100 Hz) |
+| Localization | Gazebo odometry (ground truth). VSLAM is future work. |
+| Autonomy | Python package `coordination/`: `depth_mapper`, `map_merger`, `task_allocator` (Algorithm 1), `flight_controller` (A* + pure pursuit) |
+| Visualization | Swarm overlay drawn inside the Gazebo window (`gz_overlay`); RViz2 optional (`rviz:=true`) |
+| Deployment | Ubuntu 24.04 (native or WSL2), or the cloud-GPU Docker image in [`../docker/sim/README.md`](../docker/sim/README.md) |
 
-## Main Features (Phase 1 target)
-
-* Single simulated drone in Gazebo, flown by PX4 SITL.
-* ROS 2 ↔ PX4 communication via uXRCE-DDS.
-* Occupancy-grid mapping built from simulated sensor data.
-* Frontier-based exploration: detection → clustering → scoring → selection.
-* Waypoint generation and offboard control to autonomously visit frontiers.
-* A ground-truth-pose development mode, followed by a VSLAM/VIO pose mode,
-  so localization and exploration can be debugged independently (see
-  [`docs/localization.md`](docs/localization.md)).
-* A full autonomous exploration loop with a configurable stopping condition.
-* Evaluation tooling (Python/NumPy/Pandas/Matplotlib) to measure exploration
-  performance.
-
-## Explicitly Out of Scope for Phase 1
-
-* Multiple drones / swarm coordination (see
-  [`docs/development-roadmap.md`](docs/development-roadmap.md) future-phase
-  section).
-* Any real hardware, embedded deployment, or Jetson-specific tooling.
-* Kubernetes, Docker, cloud services, databases, microservices, or web
-  applications.
-
-## Architecture Overview
-
-Two layers, kept clearly separate throughout the documentation:
-
-* **Existing infrastructure (integration work):** Gazebo, PX4 SITL, ROS 2,
-  uXRCE-DDS, sensor simulation, flight control.
-* **Project-specific autonomy (the actual contribution):** mapping, frontier
-  detection, frontier clustering, frontier scoring, frontier selection,
-  waypoint generation, exploration manager, evaluation.
-
-Full details: [`docs/architecture.md`](docs/architecture.md) and
-[`docs/system-design.md`](docs/system-design.md).
-
-High-level data flow:
+High-level loop:
 
 ```text
-Gazebo → Simulated Drone → Camera + IMU + Depth → VSLAM/VIO → Estimated Pose
-   → Occupancy Map → Frontier Detection → Frontier Clustering
-   → Frontier Selection → Waypoint Generation → ROS 2 Offboard Control
-   → PX4 SITL → Drone Movement → Map Update → (repeat)
+Gazebo (rotor physics + depth/IMU/odometry)
+   → ros_gz_bridge → per-drone depth_mapper → /{ns}/map
+   → map_merger → /global_map (+ coverage / overlap metrics)
+   → task_allocator (Algorithm 1) → /{ns}/cmd_pose
+   → flight_controller (A* on /global_map, pure pursuit) → /{ns}/cmd_vel
+   → MulticopterVelocityControl → rotor speeds → drone moves → new depth frames (repeat)
 ```
 
-Early in development, "VSLAM/VIO → Estimated Pose" is replaced by Gazebo
-ground-truth pose. See [`docs/localization.md`](docs/localization.md) and
-milestone M11 in the roadmap.
+The C++ packages under `src/` (control, exploration, localization, mapping) are from the earlier
+single-drone PX4 phase. The current launcher (`run_gazebo_swarm.sh`) builds only the `coordination`
+and `simulation` packages, so `src/` is not part of the running stack.
 
-## Technology Stack
+## How to Run
 
-| Area | Choice |
-|---|---|
-| OS | Ubuntu 22.04 LTS |
-| Robotics middleware | ROS 2 Humble |
-| Simulator | Gazebo Harmonic |
-| Flight stack | PX4 SITL |
-| ROS 2 ↔ PX4 bridge | uXRCE-DDS |
-| Visualization | RViz2, QGroundControl |
-| Core autonomy code | C++ |
-| Launch / config / analysis | Python |
-| Perception | OpenCV, VSLAM/VIO (ORB-SLAM3 or comparable) |
-| Mapping | 2D occupancy grid (path toward 3D/voxel later) |
-| Exploration | Frontier detection, clustering, scoring, selection, waypoint generation |
-| Build | CMake, colcon |
-| Source control | Git, GitHub |
-| Evaluation | Python, NumPy, Pandas, Matplotlib |
-
-See [`docs/simulation.md`](docs/simulation.md) and
-[`docs/ros2-architecture.md`](docs/ros2-architecture.md) for details.
-
-## Current Development Milestone
-
-```text
-CURRENT TARGET = M1 — Gazebo + PX4 drone works
+```bash
+./run_single_window.sh          # Linux / WSL2: one Gazebo window with the swarm overlay
+```
+```powershell
+.\run_single_window.ps1         # Windows host, runs inside WSL2 Ubuntu
 ```
 
-The project is developed incrementally, M1 through M12, and later milestones
-must not be implemented ahead of earlier ones. Full milestone definitions:
-[`docs/development-roadmap.md`](docs/development-roadmap.md).
-
-## How to Run the Project (Eventually)
-
-This section will be filled in as milestones are completed. At minimum, once
-M1–M3 exist, running the project will look like:
-
-1. Launch the Gazebo world with the simulated drone (`simulation/launch/`).
-2. Start PX4 SITL and confirm the uXRCE-DDS agent/client link is up.
-3. Launch the ROS 2 autonomy stack (`launch/`) — localization, mapping,
-   exploration, waypoint generation, PX4 interface.
-4. Observe the drone take off and begin the explore/map/waypoint loop.
-5. Watch progress in RViz2 (map, frontiers, current waypoint, drone pose).
-
-Exact commands will be added once the corresponding milestone's launch files
-exist — see [`docs/simulation.md`](docs/simulation.md).
-
-## Expected Simulation Result (Phase 1 Demonstration)
-
-A single simulated drone starts in an unknown Gazebo environment, takes off,
-and autonomously builds an occupancy map from its simulated sensors. It
-repeatedly detects frontiers (boundaries between known-free and unknown
-space), clusters and scores them, selects the best one, generates a
-waypoint, and flies there — updating the map as it goes — until an
-exploration-complete condition is met (e.g., no valid frontiers remain, a
-coverage threshold is reached, or a safety/time/distance limit triggers). In
-later milestones this runs on VSLAM/VIO pose estimates instead of simulator
-ground truth, demonstrating GPS-denied autonomy.
-
-## Roadmap
-
-| Milestone | Goal |
-|---|---|
-| M1 | Gazebo + PX4 drone works |
-| M2 | ROS 2 ↔ PX4 communication works |
-| M3 | Simulated sensors and pose available |
-| M4 | Occupancy map works |
-| M5 | Frontier detection works |
-| M6 | Frontier clustering works |
-| M7 | Frontier selection works |
-| M8 | Waypoint generation works |
-| M9 | Drone flies autonomously to waypoint |
-| M10 | Full autonomous exploration loop |
-| M11 | Replace ground-truth pose with VSLAM/VIO |
-| M12 | GPS-denied exploration evaluation |
-
-Full details, including test procedures and success criteria, are in
-[`docs/development-roadmap.md`](docs/development-roadmap.md).
-
-A future swarm/multi-drone phase is documented for context only and is
-**not** part of Phase 1 — see the "Future Phase" section of the roadmap.
+Launch arguments (`world`, `headless`, `rviz`, `sensor_profile`, `rgb_bridge`, `lock_radius`,
+`altitude`), unit tests and validation commands are documented in [`../README.md`](../README.md).
+For a cloud GPU with a browser desktop (noVNC on port 6080) see
+[`../docker/sim/README.md`](../docker/sim/README.md).
 
 ## Documentation Index
 
-* [`docs/architecture.md`](docs/architecture.md) — system architecture, data/control flow
-* [`docs/system-design.md`](docs/system-design.md) — requirements, interfaces, coordinate frames
-* [`docs/development-roadmap.md`](docs/development-roadmap.md) — M1–M12 plus future phase
-* [`docs/ros2-architecture.md`](docs/ros2-architecture.md) — nodes, topics, messages
-* [`docs/simulation.md`](docs/simulation.md) — Gazebo/PX4 simulation setup
-* [`docs/localization.md`](docs/localization.md) — ground truth → VSLAM/VIO
-* [`docs/mapping.md`](docs/mapping.md) — occupancy grid design
-* [`docs/exploration.md`](docs/exploration.md) — frontier exploration algorithm
-* [`docs/algorithms.md`](docs/algorithms.md) — per-algorithm specification
-* [`docs/evaluation.md`](docs/evaluation.md) — metrics and measurement methodology
-* [`docs/troubleshooting.md`](docs/troubleshooting.md) — common failure modes
+| Document | Contents |
+|---|---|
+| [`architecture.md`](architecture.md) | Layers, components, launch sequence, data and control flow |
+| [`system-design.md`](system-design.md) | Requirements and their status, boundaries, interfaces, coordinate frames, failure handling |
+| [`ros2-architecture.md`](ros2-architecture.md) | Nodes, topics, QoS, parameters, bridges, launch arguments |
+| [`simulation.md`](simulation.md) | Gazebo world, drone model, sensors, sensor profiles |
+| [`localization.md`](localization.md) | Ground-truth odometry today, VSLAM/VIO plan |
+| [`mapping.md`](mapping.md) | Per-drone log-odds depth mapping and conservative map fusion |
+| [`exploration.md`](exploration.md) | Frontier extraction, Algorithm 1 allocation, completion |
+| [`algorithms.md`](algorithms.md) | Per-algorithm specification (`coordination/algorithms.py`) |
+| [`evaluation.md`](evaluation.md) | Coverage, overlap and ATE metrics; validation tooling |
+| [`troubleshooting.md`](troubleshooting.md) | Common failure modes and fixes |
+| [`development-roadmap.md`](development-roadmap.md) | What is done, what is next |
 
-## For AI Coding Agents
+Related files outside this folder:
 
-This repository's `.md` files are the source of truth for implementation.
-See the "AI-Agent Friendly Requirements" section in
-[`docs/development-roadmap.md`](docs/development-roadmap.md) before writing
-any code.
+* [`../README.md`](../README.md): quick start and reference.
+* [`../simulation/launch/README.md`](../simulation/launch/README.md): launch notes (its PX4 SITL section is the legacy single-drone workflow).
+* [`../REALTIME_GAZEBO_SWARM_BLUEPRINT.md`](../REALTIME_GAZEBO_SWARM_BLUEPRINT.md): design spec written during the move to Gazebo Harmonic. It still lists PX4 SITL as the flight target, which the running stack does not use.
+
+## Future Work
+
+The PX4 SITL / MAVROS offboard backend (`simulation/launch/start_px4_*.sh`, `src/control`,
+`vslam/mavrospy.launch.py`) and the Isaac ROS Visual SLAM pipeline (`vslam/`, `sim/`) exist as
+starting points but are not wired into the running stack. See the "Future work: PX4 / VSLAM
+backend" sections of [`architecture.md`](architecture.md) and
+[`ros2-architecture.md`](ros2-architecture.md), and [`development-roadmap.md`](development-roadmap.md).
+
+## Historical Milestone Reports
+
+These describe the earlier single-drone phase (PX4 SITL, uXRCE-DDS, ROS 2 Humble, C++ packages in
+`src/`). They are kept for the record and do not describe the current system.
+
+* [`M1_README.md`](M1_README.md), [`M1_IMPLEMENTATION_SUMMARY.md`](M1_IMPLEMENTATION_SUMMARY.md), [`M1_TEST_PROCEDURE.md`](M1_TEST_PROCEDURE.md), [`M1_COMPLETION_REPORT.md`](M1_COMPLETION_REPORT.md)
+* [`M2_IMPLEMENTATION_SUMMARY.md`](M2_IMPLEMENTATION_SUMMARY.md), [`M2_TEST_PROCEDURE.md`](M2_TEST_PROCEDURE.md), [`M2_COMPLETION_REPORT.md`](M2_COMPLETION_REPORT.md)
+* [`M3_README.md`](M3_README.md), [`M4_README.md`](M4_README.md), [`M5_M6_M7_README.md`](M5_M6_M7_README.md)
+* [`M3_M7_IMPLEMENTATION_SUMMARY.md`](M3_M7_IMPLEMENTATION_SUMMARY.md), [`M3_M7_COMPLETION_REPORT.md`](M3_M7_COMPLETION_REPORT.md)
+* [`PROJECT_STATUS_M3_M7.md`](PROJECT_STATUS_M3_M7.md)

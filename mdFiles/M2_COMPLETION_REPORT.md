@@ -1,5 +1,7 @@
 # M2 Completion Report
 
+> **Historical milestone report (Phase 1, single drone).** This document records the earlier single-drone PX4 SITL + ROS 2 Humble phase and the C++ packages in `src/`. The current system is the three-drone ROS 2 Jazzy + Gazebo Harmonic swarm described in [../README.md](../README.md) and [README.md](README.md). Commands and results below are kept for reference and may no longer run as written.
+
 **Date:** 2026-08-22  
 **Milestone:** M2 — ROS 2 ↔ PX4 communication works  
 **Status:** ✅ **COMPLETE AND READY FOR TESTING**

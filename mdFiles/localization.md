@@ -1,186 +1,173 @@
 # Localization
 
-## 1. Two Stages
+What "GPS-denied" means for this project, what the stack uses for pose
+today, and the planned path to replace simulator ground truth with an
+onboard estimate. See [`../README.md`](../README.md) for the system
+overview and [`mapping.md`](mapping.md) / [`exploration.md`](exploration.md)
+for the components that consume the pose.
 
-### Development stage
+## 1. Current Status, Stated Plainly
 
-```text
-Gazebo Ground Truth
-```
+**The autonomy currently uses Gazebo ground-truth pose.** Each drone's
+pose comes from Gazebo's `OdometryPublisher` system on `/{ns}/odom`. It is
+exact, with no noise and no drift. No state estimator runs in the current
+launcher.
 
-### Final stage (target autonomy input)
+The stack is GPS-denied in the sense that **no GPS, motion-capture or
+other external positioning signal is modelled or consumed by the
+autonomy**. It does not yet estimate its own pose from onboard sensors.
+Closing that gap is the localization work described in §6.
 
-```text
-Camera + IMU
-      ↓
-VSLAM / VIO
-      ↓
-Pose
-```
+## 2. The GPS-Denied Localization Problem
 
-Both stages publish pose on the same documented topic/frame contract, so
-the mapping and exploration components never need to know which stage is
-active (see [`ros2-architecture.md`](ros2-architecture.md) §2.1).
+Target environments such as warehouses, underground facilities and
+collapsed buildings block or corrupt satellite signals. GPS is excluded
+from the autonomy entirely, not even as a fallback. Each drone must
+therefore estimate its pose from onboard sensors (camera, depth, IMU)
+alone, and the three drones must agree on a common frame. The pose is
+needed to:
 
-## 2. Why Localization Is Required
+* place depth rays into the local occupancy grid (`depth_mapper`);
+* fuse the three local maps cell by cell (`map_merger`), which assumes
+  all drones share one world frame;
+* score frontiers by distance, apply the 2.0 m exclusion zones, and detect
+  arrival (`task_allocator`);
+* plan and follow A* paths and keep 1.5 m separation (`flight_controller`);
+* filter teammates out of each drone's depth images (`depth_mapper`).
 
-The drone needs to know where it is, relative to what it has already
-mapped, in order to:
+Onboard estimators drift. Errors grow with distance travelled and are
+worst in low-texture scenes, at high speed, and with fast yaw. In a swarm,
+each drone's errors are also independent, so their maps disagree unless
+the drones are aligned to each other.
 
-* Correctly place new sensor observations into the occupancy grid.
-* Know its own position relative to a selected frontier for distance-cost
-  scoring.
-* Know when it has arrived at a commanded waypoint.
+## 3. What the Current Stack Does
 
-Without a pose estimate, none of the mapping or exploration pipeline can
-function, regardless of how that pose estimate is produced.
+| Topic | Source | Rate | Used by |
+|---|---|---|---|
+| `/{ns}/odom` (`nav_msgs/Odometry`, frame `map`) | Gazebo `OdometryPublisher`, ground truth | 30 Hz | `depth_mapper` (own pose and teammates), `task_allocator`, `flight_controller` (own pose and teammates) |
+| `/{ns}/ground_truth_pose` (`geometry_msgs/PoseStamped`) | Gazebo `PosePublisher` | 30 Hz | nothing in the autonomy; available as an evaluation reference |
+| `/{ns}/imu` (`sensor_msgs/Imu`) | Gazebo IMU, BMI055-class white noise + turn-on and drifting bias | 200 Hz | nothing yet; intended input for VIO |
+| `/{ns}/depth/image` (`32FC1`, 87° HFOV) | Gazebo depth camera | 10 Hz `realtime` / 30 Hz `full` | `depth_mapper` |
+| `/{ns}/camera/image` (640 × 480 RGB, 60° HFOV) | Gazebo camera, only with `rgb_bridge:=true` | 30 Hz | nothing yet |
 
-## 3. Why GPS Is Not Used
+`task_allocator` also subscribes to `/{ns}/mavros/local_position/pose`, so
+on hardware it can take the PX4 estimate instead of Gazebo odometry.
 
-This project's defining constraint is GPS-denied operation: the target
-deployment scenarios (indoor, urban canyon, underground, disaster sites)
-are exactly the situations where GPS is degraded or unavailable. Building
-the exploration system around a GPS dependency would make it inapplicable
-to the scenarios this project is meant to address. GPS is therefore
-excluded from the autonomy pipeline entirely — it is not used as a fallback
-or a sanity check within the autonomy stack. PX4 itself may still have GPS
-support available internally as a general-purpose flight-controller
-feature, but the exploration autonomy this project builds does not consume
-GPS data.
+Sensor parameters are in `simulation/models/quadrotor_px4.sdf`. The IMU
+white noise follows the BMI055 datasheet (gyro $3.45 \times 10^{-3}$ rad/s,
+accel $2.08 \times 10^{-2}$ m/s² per sample at 200 Hz). The bias terms are
+marked in the SDF as estimates to be replaced by an Allan-variance fit.
 
 ## 4. Why Ground Truth First
 
-This is the most important methodological decision in the project and is
-repeated here deliberately (it also appears in
-[`development-roadmap.md`](development-roadmap.md)).
-
-Localization (state estimation from noisy sensors) and exploration (deciding
-where to go given a map) are two largely independent problems. If both are
-implemented and debugged simultaneously, a failure in the exploration loop
-is hard to distinguish from a failure caused by pose drift or VSLAM
-tracking loss.
-
-By using Gazebo's ground-truth pose first (M4–M10), the mapping and
-exploration algorithms can be fully validated against a perfect pose
-source. Only once that pipeline is known to work (M10) is ground truth
-replaced with VSLAM/VIO (M11) — at which point any new problems that
-appear can be attributed to localization, not to the exploration logic.
+Localization (estimating pose from noisy sensors) and exploration
+(deciding where to go given a map) are separate problems. Debugging both
+at once makes it impossible to tell an exploration bug from pose drift.
+With ground truth, mapping, fusion, Algorithm 1 and planning were validated
+against a perfect pose. When an estimator is swapped in, any new failure
+can be attributed to localization.
 
 ```text
-Gazebo Ground Truth Pose
-        ↓
-Mapping
-        ↓
-Frontier Detection
-        ↓
-Frontier Selection
-        ↓
-Waypoint
-        ↓
-PX4
+now:     Gazebo odometry (exact) ─────────────► /{ns}/odom ─► mapping, allocation, control
+planned: camera + IMU ─► VIO / VSLAM (─► EKF2) ─► /{ns}/odom ─► mapping, allocation, control
+                                       Gazebo ground truth ─► evaluation only (ATE)
 ```
 
-is replaced, once validated, with:
+Ground truth must stay out of the autonomy loop once an estimator exists.
+In simulation it remains available as the reference for ATE (§8).
 
-```text
-Camera + IMU
-      ↓
-VSLAM / VIO
-      ↓
-Estimated Pose
-        ↓
-Mapping
-        ↓
-Frontier Detection
-        ↓
-Frontier Selection
-        ↓
-Waypoint
-        ↓
-PX4
-```
+## 5. Options for GPS-Denied Pose
 
-Ground-truth pose must never be used in the final Phase-1 demonstration
-(M12) — it is a development and debugging aid only.
+| Approach | What it does | Strengths | Weaknesses |
+|---|---|---|---|
+| **Visual-inertial odometry (VIO)** | Tracks visual features and integrates the IMU in a filter or sliding window | Low latency, metric scale from the IMU, cheap | Drifts without bound; no loop closure |
+| **Visual SLAM (with IMU)** | VIO plus a persistent map, relocalization and loop closure | Bounded drift when revisiting places; reusable map | Heavier; loop-closure jumps must be handled by downstream nodes |
+| **PX4 EKF2 external-vision fusion** | The flight controller fuses an external pose (VIO/VSLAM via MAVROS `vision_pose`) with its own IMU | High-rate, smooth estimate the flight controller trusts for offboard control | Only as good as the vision input; needs time sync and frame conventions right |
 
-## 5. VSLAM/VIO Candidates
+Candidates: **Isaac ROS Visual SLAM** (cuVSLAM: stereo + IMU, GPU, the one
+the repo already has launch files for), **ORB-SLAM3** (mono/stereo/RGB-D,
+optionally inertial, with loop closure), and lighter VIO such as
+**OpenVINS** or **VINS-Fusion**. These are complementary: the realistic
+design is VIO/VSLAM feeding EKF2, with the PX4 estimate used as the
+drone's pose.
 
-* **ORB-SLAM3** — full-featured, well-documented, supports monocular,
-  stereo, and monocular-inertial/stereo-inertial modes; a reasonable
-  default candidate given the "or another well-supported VIO/VSLAM
-  solution" allowance in the technology stack.
-* **Other well-supported alternatives** may be substituted if there is a
-  strong technical reason (e.g., better ROS 2 integration available at
-  implementation time, licensing considerations, or better performance in
-  the chosen simulated environments). Any substitution must be documented
-  here along with the reason, per the "never silently replace a major
-  technology" rule in [`development-roadmap.md`](development-roadmap.md).
+For a swarm there is a further requirement: **a shared frame**. Each
+estimator starts its own frame at its own take-off pose. The options are
+known start poses (the spawn offsets in simulation, surveyed positions on
+hardware), inter-drone map alignment (matching local maps or visual place
+recognition between drones), or a multi-robot SLAM back end.
+`map_merger` assumes the local maps are already aligned.
 
-This project does not fix the exact VSLAM/VIO package at the documentation
-stage — that decision is deferred to M11 implementation time, informed by
-what integrates most cleanly with ROS 2 Humble and the chosen camera/IMU
-setup.
+## 6. Planned Path to Replace Ground Truth
 
-## 6. Interface Between Localization and Mapping
+The repo contains hardware-side starting points that are **not wired into
+the simulation launcher**:
 
-* Localization publishes a single pose estimate (position + orientation)
-  in the map frame, on a fixed, documented topic — identical in shape
-  whether sourced from ground truth or VSLAM/VIO.
-* Mapping consumes only this pose topic; it does not know or care which
-  underlying method produced it.
-* This contract must not change between M4 (ground truth) and M11
-  (VSLAM/VIO) — if it needs to change, that is a signal the interface was
-  under-specified and should be fixed rather than worked around.
+* `vslam/isaac_ros_vslam_realsense.py`: per-drone namespace, RealSense
+  D435i stereo IR (640 × 480 at 30 Hz) and IMU (200 Hz) into Isaac ROS
+  Visual SLAM with IMU fusion. It publishes
+  `/<ns>/visual_slam/tracking/vo_pose_covariance`. `sim/isaac_ros_vslam.sh`
+  launches it for one namespace.
+* `vslam/mavrospy.launch.py`: MAVROS to a Pixhawk plus a `topic_tools`
+  relay from the VSLAM pose to `mavros/vision_pose/pose_cov`, the input of
+  EKF2's external-vision fusion. The EKF2 parameters themselves (vision
+  position/yaw fusion enabled, GPS disabled) still have to be set on the
+  flight controller; the launch file does not set them.
+
+Steps:
+
+1. **Give the simulated drone the sensors the estimator needs.** The SDF
+   has a mono RGB camera, a depth camera and an IMU, but no stereo IR pair,
+   so Isaac ROS VSLAM cannot run on it unchanged. Either add a stereo
+   camera pair to `quadrotor_px4.sdf` or choose an estimator that accepts
+   RGB-D + IMU or mono + IMU.
+2. **Run one estimator per drone** under `/{ns}/` and publish its result as
+   `nav_msgs/Odometry` in a world frame. The simplest version transforms it
+   by the known spawn pose.
+3. **Swap the input:** point `depth_mapper`, `task_allocator` and
+   `flight_controller` at the estimated odometry instead of Gazebo's. The
+   nodes only need a `nav_msgs/Odometry` in a common `map` frame, so no
+   algorithm changes are required.
+4. **Time-align depth and pose** in `depth_mapper` (look up the pose at the
+   depth image stamp instead of using the latest message) once the pose is
+   no longer exact.
+5. **Measure** ATE against `/{ns}/ground_truth_pose` (§8), then evaluate
+   how drift affects coverage and the fused map.
+6. **Hardware / PX4:** feed the estimate to EKF2 through MAVROS and use
+   `/{ns}/mavros/local_position/pose` (already supported by
+   `task_allocator`) as the pose source. The PX4 SITL scripts in
+   `simulation/launch/start_px4_*.sh` and `src/control` are the starting
+   point for a PX4 backend in simulation.
 
 ## 7. Coordinate Frames
 
-* **Map frame:** fixed, global frame the occupancy grid and all frontier/
-  waypoint computations are expressed in.
-* **Odometry frame:** the frame VSLAM/VIO naturally publishes in before any
-  correction; may drift relative to the map frame over time.
-* **Body frame:** drone-fixed frame.
+* **`map`:** the fixed world frame. Gazebo publishes odometry directly in
+  it (`odom_frame` = `map` in the SDF), and all grids, frontiers, goals and
+  paths are expressed in it.
+* **`{ns}/base_link`:** the body frame of each drone. The depth camera sits
+  0.13 m ahead of it, looking along $+x$.
+* **`odom`:** not used today. With an estimator, follow REP-105
+  (`map → odom → base_link`). The Isaac ROS launch already names
+  `map`, `odom` and `base_link`.
 
-Exact frame names and the specific transform tree should follow standard
-ROS conventions (e.g., `REP-105`-style `map` → `odom` → `base_link`) and be
-finalized in [`ros2-architecture.md`](ros2-architecture.md) once M3/M11 are
-implemented. This document intentionally does not fix exact frame names to
-avoid duplicated, potentially conflicting definitions across documents.
+## 8. Evaluating Localization
 
-## 8. Drift Considerations
+`validation/validate.py` computes, per drone, the absolute trajectory
+error between ground truth and the estimate:
 
-* VSLAM/VIO pose estimates drift over time and distance traveled, unlike
-  Gazebo ground truth, which is always exact.
-* The exploration algorithm should not assume perfect pose once M11 is
-  implemented; excessive drift can cause the drone to select/generate
-  waypoints based on an inaccurate map alignment.
-* Loop closure (recognizing a previously visited area) is a standard
-  mitigation in full SLAM systems (as opposed to pure VIO) and should be
-  considered during M11 if drift proves significant in the target
-  environments, but is not a hard Phase-1 requirement beyond what the
-  chosen VSLAM/VIO library provides out of the box.
-* Drift should be quantified during evaluation (M12) by comparing
-  VSLAM/VIO pose against Gazebo ground truth, which remains available in
-  simulation purely as an evaluation reference, never as an autonomy input,
-  post-M11 (see [`evaluation.md`](evaluation.md), localization error
-  metric).
+$$\text{ATE}_i = \lVert p^{gt}_i - p^{est}_i \rVert_2, \qquad
+\text{RMSE}_{\text{ATE}} = \sqrt{\tfrac{1}{N}\textstyle\sum_i \text{ATE}_i^2}, \qquad
+\text{RMSE}_{\psi} = \sqrt{\tfrac{1}{N}\textstyle\sum_i \operatorname{wrap}(\psi^{gt}_i - \psi^{est}_i)^2}$$
 
-## 9. How to Evaluate Localization
+It reads `validation/output/{ns}_trajectory.csv` (columns `gt_*` and
+`vslam_*`) and plots the trajectories and the error over time. The target
+printed by the script is ATE RMSE < 0.10 m.
 
-* Log both the VSLAM/VIO pose estimate and the Gazebo ground-truth pose
-  during a run (ground truth used only for offline comparison, never fed
-  back into the autonomy pipeline).
-* Compute pose error (e.g., position error over time, drift rate) as
-  described in [`evaluation.md`](evaluation.md).
-* Correlate localization error against exploration outcomes (e.g., did
-  drift cause a bad waypoint or map misalignment) to distinguish
-  localization failures from exploration-algorithm failures — this is the
-  entire point of the ground-truth-first strategy in §4.
-
-## 10. Scope Note
-
-This document intentionally keeps the localization discussion at the level
-needed to integrate a VSLAM/VIO system into the exploration pipeline. It is
-not a tutorial on SLAM/VIO theory, and it does not attempt to pick or tune
-a specific VSLAM configuration ahead of M11 implementation — doing so here
-would risk over-specifying a decision that should be informed by actual
-integration experience.
+**Caveat:** since no estimator runs yet, there is no real data to
+evaluate. `validation/parse_rosbag.py` does not parse a bag today. It
+writes synthetic circular trajectories with added noise, so any ATE it
+reports is illustrative, not a measurement. To make it real, record
+`/{ns}/ground_truth_pose` and the estimator's pose, align the first poses
+and interpolate both onto common timestamps. Neither step is implemented
+in `validate.py` yet. Then correlate ATE with coverage and fused-map
+quality. See [`evaluation.md`](evaluation.md) for the full metric set.

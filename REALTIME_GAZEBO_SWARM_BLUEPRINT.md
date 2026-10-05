@@ -3,6 +3,11 @@
 **Target Platform**: ROS 2 Jazzy + Gazebo Harmonic (8.15+) + PX4 SITL  
 **Primary Architecture**: Distributed Decentralized Mapping & Greedy Spatial-Exclusion Coordination  
 
+> **Partly superseded (Oct 2026):** this is the original gap analysis. Since then the stack has been
+> built without PX4 (Gazebo `MulticopterVelocityControl`); the IMU runs at 200 Hz, and
+> `coordination/test_swarm_coordination.py` has 11 tests. For the current design see
+> [README.md](README.md) and [mdFiles/architecture.md](mdFiles/architecture.md).
+
 ---
 
 ## 1. Executive Summary & Repository Scan

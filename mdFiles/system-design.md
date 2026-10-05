@@ -1,121 +1,123 @@
 # System Design
 
+> Describes the running three-drone stack (Gazebo Harmonic + ROS 2 Jazzy, Python `coordination`
+> package). Component layout and data flow are in [`architecture.md`](architecture.md); exact
+> topic and parameter names are in [`ros2-architecture.md`](ros2-architecture.md).
+
 ## 1. Functional Requirements
 
-| ID | Requirement |
-|---|---|
-| FR-1 | The system shall simulate a single drone in Gazebo, controlled via PX4 SITL. |
-| FR-2 | The system shall estimate the drone's pose without using GPS. Early milestones may use simulator ground-truth pose as a development stand-in (see [`localization.md`](localization.md)). |
-| FR-3 | The system shall build and maintain a 2D occupancy grid map from simulated sensor observations and the current pose estimate. |
-| FR-4 | The system shall detect frontier cells (FREE cells adjacent to UNKNOWN cells) in the occupancy grid. |
-| FR-5 | The system shall cluster connected frontier cells into candidate exploration regions. |
-| FR-6 | The system shall score candidate frontier clusters using a modular scoring function (initially `information_gain - distance_cost`). |
-| FR-7 | The system shall select the highest-scoring valid frontier as the next exploration target. |
-| FR-8 | The system shall convert a selected frontier into a waypoint that is validated for map validity and obstacle clearance before being sent to the flight controller. |
-| FR-9 | The system shall send waypoints to PX4 via ROS 2 offboard control and verify waypoint arrival. |
-| FR-10 | The system shall repeat sense → map → detect → cluster → score → select → waypoint → navigate until an exploration-complete condition is met. |
-| FR-11 | The system shall support at least these exploration-complete conditions, each independently configurable: no valid frontiers remain, coverage threshold reached, max flight time reached, max distance reached, safety condition triggered. |
-| FR-12 | The system shall be able to run the exploration loop using either ground-truth pose (development mode) or VSLAM/VIO pose (target mode) without changing the exploration algorithm itself. |
-| FR-13 | The system shall provide evaluation tooling to compute exploration metrics from a completed run (see [`evaluation.md`](evaluation.md)). |
+| ID | Requirement | Status |
+|---|---|---|
+| FR-1 | Simulate three quadrotors with rotor physics and onboard sensors (depth camera, IMU, odometry) in a walled indoor arena. | Done: Gazebo Harmonic, `quadrotor_px4.sdf` ×3 |
+| FR-2 | Estimate each drone's pose without GPS. | Partial: Gazebo odometry (ground truth) stands in; VSLAM/VIO is future work ([`localization.md`](localization.md)) |
+| FR-3 | Build a 2D occupancy grid per drone from that drone's own depth images and pose. | Done: `depth_mapper` |
+| FR-4 | Fuse the per-drone grids into one global grid, never overwriting an observed obstacle with free space. | Done: `map_merger`, conservative fusion |
+| FR-5 | Detect frontier cells (free cells with an unknown 8-neighbour) and cluster them. | Done: `task_allocator` |
+| FR-6 | Assign frontiers to drones so that no two drones target the same region (2.0 m exclusion, Algorithm 1). | Done: `greedy_assign` |
+| FR-7 | Score frontiers with a replaceable utility, `α·IG·discount − β·distance`. | Done: weights and sensor radius are parameters |
+| FR-8 | Plan a collision-free path to the assigned frontier on the fused map and fly it. | Done: A* + pure pursuit in `flight_controller` |
+| FR-9 | Keep drones apart in flight. | Done: 1.5 m reactive separation |
+| FR-10 | Detect unreachable targets and recover. | Done: 20 s progress watchdog, blacklist |
+| FR-11 | Stop exploring when no worthwhile frontier is left. | Done: allocator logs EXPLORATION COMPLETE, drones hold position |
+| FR-12 | Report coverage and overlap live. | Done: `/swarm/metrics/coverage_pct`, `/swarm/metrics/overlap_rate` |
+| FR-13 | Provide offline evaluation (coverage, overlap, ATE). | Partial: `validation/`; ATE needs a VSLAM estimate ([`evaluation.md`](evaluation.md)) |
+| FR-14 | Run the mapping and exploration code unchanged whether the pose comes from ground truth or VSLAM. | Design rule; only ground truth exists today |
+
+Stop conditions other than "no frontiers" (coverage threshold, max time, max distance) from the
+single-drone design are not implemented.
 
 ## 2. Non-Functional Requirements
 
 | ID | Requirement |
 |---|---|
-| NFR-1 | The system shall run entirely in software simulation; no physical hardware dependency of any kind. |
-| NFR-2 | Core autonomy nodes (mapping, frontier detection/clustering/selection, waypoint generation) shall be implemented in C++ for performance and consistency with ROS 2 conventions; launch, configuration, and evaluation scripts shall be Python. |
-| NFR-3 | The mapping and exploration algorithms shall be modular: the scoring function, the clustering method, and the localization source shall each be replaceable without rewriting the surrounding pipeline. |
-| NFR-4 | The system shall be developed and validated incrementally, milestone by milestone, per [`development-roadmap.md`](development-roadmap.md); later milestones must not be implemented before earlier ones are working. |
-| NFR-5 | Interfaces between components (topics, messages, coordinate frames) shall be documented before being relied upon by more than one component. |
-| NFR-6 | The system shall not introduce infrastructure (databases, containers, microservices, cloud services) beyond what is needed to run a single-process robotics simulation stack. |
-| NFR-7 | Any interface whose exact form depends on the installed PX4/ROS 2/Gazebo version shall be explicitly marked as version-dependent rather than hard-documented as fixed. |
+| NFR-1 | Software only. No hardware is needed to run or evaluate the system. |
+| NFR-2 | Autonomy code is Python (`rclpy` + numpy). Algorithms live in `coordination/algorithms.py` with no ROS dependency, so they can be unit-tested directly. |
+| NFR-3 | Modular: utility function, clustering, map fusion and pose source are replaceable without rewriting the surrounding nodes. |
+| NFR-4 | Every node uses simulation time (`use_sim_time`), so behaviour does not change when the simulation runs slower than real time. |
+| NFR-5 | Near real time on a laptop: the `realtime` sensor profile, the 100 Hz clock relay and the opt-in RGB bridge exist to keep the three-drone stack fast enough under WSL2. On a native Linux host with an NVIDIA GPU it runs in real time. |
+| NFR-6 | Reproducible: one command (`run_single_window.sh` / `.ps1`, or `docker/sim/run_docker.sh`) builds and starts everything. |
+| NFR-7 | Interfaces (topics, messages, frames) are documented in [`ros2-architecture.md`](ros2-architecture.md) before more than one component relies on them. |
 
 ## 3. System Boundaries
 
-**In scope (Phase 1):**
-* Single simulated drone.
-* Full sense→map→explore→navigate loop in Gazebo + PX4 SITL.
-* Ground-truth-pose development mode and VSLAM/VIO target mode.
-* 2D occupancy-grid-based frontier exploration.
-* Evaluation of a single drone's exploration run.
+**In scope:**
+* Three simulated drones, centralized allocation, per-drone mapping and control.
+* Gazebo Harmonic physics and sensors; ROS 2 Jazzy.
+* 2D occupancy-grid mapping and frontier exploration at a fixed altitude (1.5 m by default).
+* Local runs (Ubuntu 24.04 native or WSL2) and the cloud-GPU container
+  ([`../docker/sim/README.md`](../docker/sim/README.md)).
 
-**Out of scope (Phase 1):**
-* Multiple drones / swarm coordination (documented separately as a future
-  phase in [`development-roadmap.md`](development-roadmap.md), not
-  implemented now).
-* Any physical hardware, embedded compute target, or hardware bring-up.
-* 3D/voxel mapping as the primary representation (2D is primary; a path
-  toward 3D is documented but not implemented in Phase 1).
-* Anything beyond a single-process, single-machine simulation stack
-  (no distributed systems, cloud, or web components).
+**Out of scope for the running stack (future work):**
+* PX4 SITL or any other flight stack; Gazebo's velocity controller flies the drones.
+* VSLAM / VIO localization.
+* Physical hardware (the `vslam/` launch files target a Jetson + Pixhawk + RealSense setup, but
+  nothing in the running stack depends on them).
+* 3D / voxel mapping.
+* Decentralized allocation and communication-range limits; all nodes share one ROS 2 graph.
 
 ## 4. Component Responsibilities
 
-See [`architecture.md`](architecture.md) §2 for the full component table.
-Each autonomy component owns exactly one stage of the pipeline and
-communicates only through documented topics/messages — components do not
-reach into each other's internal state.
+See [`architecture.md`](architecture.md) §2. Each node owns one stage and communicates only
+through topics. The one shared dependency is `coordination/algorithms.py`, which holds the pure
+functions every node calls.
 
 ## 5. Interfaces
 
-Interfaces between autonomy components are ROS 2 topics/services/actions.
-The authoritative list of node names, topics, and message types is
-[`ros2-architecture.md`](ros2-architecture.md). This document defines the
-*kinds* of interface each boundary needs; exact names are defined there to
-avoid two documents disagreeing.
+All boundaries are ROS 2 topics. There are no services or actions in the running stack.
 
-| Boundary | Interface kind |
+| Boundary | Interface |
 |---|---|
-| Sensors → Localization | Topic (image, IMU, depth streams) |
-| Localization → Mapping | Topic (pose estimate) |
-| Mapping → Frontier Detector | Topic (occupancy grid) |
-| Frontier Detector → Clustering | Topic or in-process call (frontier cell list) |
-| Clustering → Selector | Topic or in-process call (cluster list with properties) |
-| Selector → Waypoint Generator | Topic or in-process call (selected frontier target) |
-| Waypoint Generator → PX4 Interface | Topic (validated waypoint / setpoint) |
-| PX4 Interface → PX4 | uXRCE-DDS bridged uORB topics |
-| Exploration Manager → all autonomy nodes | Orchestration via topics/services/parameters |
+| Gazebo → ROS 2 | `ros_gz_bridge`: `/{ns}/odom`, `/{ns}/ground_truth_pose`, `/{ns}/imu`, `/{ns}/depth/image`, `/{ns}/depth/camera_info` |
+| Gazebo clock → ROS 2 | `clock_relay` (gz-transport subscriber) → `/clock` |
+| Depth mapper → map merger | `/{ns}/map` (`nav_msgs/OccupancyGrid`) |
+| Map merger → allocator, controllers, overlay | `/global_map` (latched) |
+| Allocator → flight controller | `/{ns}/cmd_pose` (`geometry_msgs/PoseStamped`) |
+| Flight controller → Gazebo | `/{ns}/cmd_vel` (`Twist`, body frame), `/{ns}/enable` (`Bool`) via `ros_gz_bridge` |
+| Flight controller → overlay | `/{ns}/plan` (`nav_msgs/Path`) |
+| Allocator → overlay / RViz2 | `/swarm/markers/frontiers`, `/swarm/markers/locked_regions` |
+| Overlay → Gazebo GUI | gz-transport request to `/marker_array` |
 
-Whether a given boundary is a ROS 2 topic vs. an in-process function call is
-an implementation decision to be made at the corresponding milestone and
-recorded in [`ros2-architecture.md`](ros2-architecture.md) once decided.
+In-process (function calls into `algorithms.py`, not topics): frontier extraction and clustering,
+greedy assignment, obstacle inflation, A*, ray casting and log-odds updates.
 
 ## 6. Coordinate Frames
 
-At minimum, the following frames must be defined and kept consistent
-(exact frame names to be finalized in [`ros2-architecture.md`](ros2-architecture.md)
-and [`mapping.md`](mapping.md), following standard ROS `REP-105` conventions
-where applicable):
+| Frame | Definition |
+|---|---|
+| `map` | Fixed world frame. Gazebo odometry is published in it (`odom_frame` = `map`), and every grid, path, goal and marker uses it. |
+| `{ns}/base_link` | Drone body frame (`drone_1/base_link`, ...). TF `map → {ns}/base_link` is broadcast by `swarm_sim_bridge`, so it exists only with `rviz:=true`. Nodes read the pose from `/{ns}/odom` directly, not from TF. |
+| Body velocity frame | `/{ns}/cmd_vel` is expressed in the yaw-rotated body frame expected by `MulticopterVelocityControl`; `flight_controller` rotates its world-frame command before publishing. |
+| Depth camera | Fixed at 0.13 m forward of `base_link` (`camera_offset` parameter, must match the SDF), 87° HFOV. |
 
-* **World/map frame** — fixed frame the occupancy grid is expressed in.
-* **Odometry frame** — frame the pose estimate is published in before any
-  loop-closure/drift correction is applied.
-* **Body frame** — drone-fixed frame (sensors are mounted relative to this).
-* **Sensor frames** — camera frame, IMU frame, depth-sensor frame, each with
-  a fixed, documented transform to the body frame.
+Grid geometry shared by all maps: 200 × 200 cells, 0.2 m resolution, origin (−20, −20) in `map`.
+The merger ignores a local map whose geometry differs.
 
-The relationship between the ground-truth pose (used in early milestones)
-and the VSLAM/VIO pose (used from M11 onward) must be expressed in the same
-map frame so that mapping and exploration code do not need to know which
-pose source is active. This is what allows localization and exploration to
-be debugged independently — see [`localization.md`](localization.md) §"Why
-ground truth first."
+Any future VSLAM pose must be expressed in the same `map` frame, so the mapping and exploration
+code do not need to know which pose source is active (FR-14).
 
 ## 7. Data Flow
 
-See [`architecture.md`](architecture.md) §3–§7 for the full data-flow
-description; not repeated here to avoid duplication drift.
+See [`architecture.md`](architecture.md) §4–§8.
 
 ## 8. Failure Handling
 
-| Failure | Expected handling |
+| Failure | Implemented handling |
 |---|---|
-| Pose estimate unavailable or stale | Exploration manager pauses navigation; does not command a waypoint based on stale/missing pose. |
-| No frontiers found | Treated as a candidate exploration-complete condition (see FR-11), not an error. |
-| Selected frontier fails waypoint validation (e.g., inside an obstacle) | Waypoint generator rejects it; frontier selector must supply the next-best candidate. |
-| PX4 not in offboard mode / rejects setpoint | PX4 interface node reports failure to the exploration manager; manager retries or aborts per configurable policy. |
-| Map update stalls (no new sensor data) | Treated as a fault condition; exploration manager should not proceed to frontier detection on a stale map. |
-| VSLAM/VIO tracking loss (post-M11) | Documented explicitly in [`localization.md`](localization.md); exploration manager should hold position rather than continue navigating on an unreliable pose. |
+| No depth or odometry yet | `depth_mapper` skips integration and publishes no map until one frame is integrated. |
+| Drone too low to map | Depth frames are ignored while the drone is below 0.8 m (`min_mapping_altitude`). |
+| Teammate or own propellers in the depth image | Returns within 0.6 m of a teammate or closer than 0.35 m are not written as obstacles. |
+| Local map with a different grid geometry | `map_merger` ignores it and warns. |
+| Drone not yet airborne | `task_allocator` does not task drones below 1.0 m. |
+| Target unreachable | No 0.5 m progress for 20 s: target blacklisted (1.0 m radius), lock released, drone reassigned. |
+| No collision-free path | `flight_controller` logs a warning and clears the path; the drone stops moving towards the goal until a replan (1 Hz) succeeds. |
+| Allocator silent | No `cmd_pose` for 2 s: goal dropped, drone holds position. |
+| Drones converging | Reactive repulsion inside 1.5 m, on top of the 2.0 m target exclusion. |
+| `enable` published before the bridge subscribes | Controller waits for a subscriber before counting arming ticks. |
+| No frontiers left | Not an error: EXPLORATION COMPLETE, drones hold. Exploration resumes if new frontiers appear. |
+| Stale Gazebo server from an earlier run | `run_gazebo_swarm.sh` kills leftover `gz sim` and bridge processes before launching. |
+| Gazebo GUI absent (`headless:=true`) | `gz_overlay` is not started. |
 
-Detailed symptom-based debugging guidance is in
+Not handled: pose-estimate loss (ground truth cannot fail), battery, and stalled sensor streams
+(a frozen depth stream leaves the map unchanged rather than raising a fault). These matter once
+the future VSLAM / PX4 backend is in place. Symptom-based guidance:
 [`troubleshooting.md`](troubleshooting.md).

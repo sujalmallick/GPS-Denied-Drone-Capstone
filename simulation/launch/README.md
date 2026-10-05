@@ -1,165 +1,84 @@
-# M1 Simulation Launch Guide
+# Simulation Launch Guide
 
-> **Swarm simulation:** the 3-drone real-time stack is started with
-> `ros2 launch simulation gazebo_swarm.launch.py` (or `./run_gazebo_swarm.sh` from the repo root,
-> ROS 2 Jazzy). It spawns `models/quadrotor_px4.sdf` once per drone with Gazebo's own rotor-physics
-> velocity controller. The PX4 SITL instructions below are the legacy single-drone M1 workflow.
-
-This directory contains launch files and scripts for M1 testing:
-**Gazebo + PX4 drone works**
+Launch files for the three-drone GPS-denied exploration swarm (ROS 2 Jazzy + Gazebo Harmonic).
 
 ## Files
 
-- `simple_world.launch.py` — ROS 2 launch file for Gazebo + drone model
-- `start_px4_sitl.sh` — Bash script to start PX4 SITL alongside Gazebo
+| File | Purpose |
+|---|---|
+| `gazebo_swarm.launch.py` | **Main launch.** Gazebo server + GUI, three drones, ROS ↔ Gazebo bridges, swarm autonomy stack |
+| `simple_world.launch.py` | Legacy M1: Gazebo with one drone, for the PX4 SITL workflow |
+| `start_px4_sitl.sh`, `start_px4_swarm.sh` | Legacy / future work: PX4 SITL (one or three instances). Not used by the current stack |
 
 ## Prerequisites
 
-1. **Ubuntu 22.04 LTS**
-2. **Gazebo Harmonic** installed
-3. **PX4 Autopilot** source code cloned and built for SITL
-4. **ROS 2 Humble** installed and sourced
+- Ubuntu 24.04 (native or WSL2)
+- ROS 2 Jazzy with `ros-jazzy-ros-gz` (Gazebo Harmonic). RViz2 is optional.
+- Or no local install at all: use the cloud-GPU container in [`docker/sim`](../../docker/sim/README.md).
 
-## Quick Start
+## Quick start
 
-### Terminal 1: Start Gazebo with the drone model
-
-```bash
-# Source ROS 2 environment
-source /opt/ros/humble/setup.bash
-
-# From the project root directory
-ros2 launch simulation simple_world.launch.py
-```
-
-This will start Gazebo with:
-- The simple world (with ground plane and obstacles)
-- A quadrotor drone model at spawn position (0, 0, 0.1)
-
-Gazebo should start with the world visible and the drone hovering slightly above ground.
-
-### Terminal 2: Start PX4 SITL
+From the repository root:
 
 ```bash
-# Source PX4 environment (if using auto-generated setup script)
-# Or manually ensure PX4 build artifacts are available
-
-cd simulation/launch
-chmod +x start_px4_sitl.sh
-./start_px4_sitl.sh
+./run_single_window.sh
 ```
 
-This will:
-1. Check for PX4 source and build directories
-2. Start PX4 SITL connected to the running Gazebo instance
-3. Initialize the drone's flight controller
-
-### Terminal 3 (Optional): Monitor with QGroundControl
-
-QGroundControl can connect to PX4 SITL for monitoring:
+This builds `coordination` and `simulation` with colcon, stops any leftover Gazebo processes, then
+runs this launch file. To launch it directly:
 
 ```bash
-qgroundcontrol
+source /opt/ros/jazzy/setup.bash
 ```
-
-QGroundControl should automatically detect the PX4 instance on UDP port 14550.
-
-## Testing M1 Acceptance Criteria
-
-Once both Gazebo and PX4 SITL are running, test the following using **PX4 MAVLink shell**:
-
-### In the PX4 shell:
-
-1. **Arm the drone:**
-   ```
-   arm
-   ```
-   The drone should arm without errors (check PX4 logs for any safety violations).
-
-2. **Takeoff:**
-   ```
-   takeoff 1.0
-   ```
-   The drone should rise to 1 meter above ground and hover.
-
-3. **Monitor altitude:**
-   ```
-   status
-   ```
-   Should show position data (altitude increasing, stable hover).
-
-4. **Land:**
-   ```
-   land
-   ```
-   The drone should descend smoothly and disarm upon landing.
-
-### Expected Behavior
-
-- **Drone arms smoothly:** No pre-arm failures
-- **Takeoff stable:** No erratic pitch/roll, smooth climb
-- **Hover stable:** Altitude holding without divergence or oscillation
-- **Landing smooth:** Controlled descent, safe contact with ground
-- **No crashes:** Drone should not collide with obstacles or world bounds
-
-### Troubleshooting
-
-If the drone fails to arm or behaves erratically, check:
-
-1. **Gazebo and PX4 communication:**
-   - Both processes should be running (check process list)
-   - No error messages in either terminal
-
-2. **IMU/Sensor data:**
-   - In PX4 shell: `commander status` should show all sensors OK
-   - Check IMU data is flowing (not NaN or stale)
-
-3. **World/model loading:**
-   - Gazebo window should display the world with the drone
-   - Drone should be above ground (not clipping into floor)
-
-4. **Physics/Stability:**
-   - If the drone oscillates wildly, the physics tuning may need adjustment
-   - Verify PX4 SITL is configured for Gazebo Harmonic (not Classic)
-
-## Configuration
-
-### Changing the World
-
-To use a different world, modify `simple_world.launch.py` or pass arguments:
-
 ```bash
-ros2 launch simulation simple_world.launch.py world:=/path/to/your/world.sdf
+colcon build --packages-select coordination simulation && source install/setup.bash
 ```
-
-### Gazebo Model Path
-
-The launch file automatically sets `GZ_SIM_RESOURCE_PATH` to point to `simulation/models/`.
-If models are not found, verify the path is correct in the launch file.
-
-### PX4 Build Directory
-
-Edit `start_px4_sitl.sh` to set `PX4_SOURCE_DIR` and `PX4_BUILD_DIR` to match your installation:
-
 ```bash
-PX4_SOURCE_DIR="/path/to/PX4-Autopilot"
-PX4_BUILD_DIR="/path/to/PX4-Autopilot/build/px4_sitl_default"
+ros2 launch simulation gazebo_swarm.launch.py
 ```
 
-## Next Steps (M2+)
+Build only these two packages. A bare `colcon build` fails, because `src/control` needs `px4_msgs`
+and `src/localization` needs `gazebo_ros`.
 
-Once M1 is validated (drone arms, takes off, hovers, lands):
+## Arguments
 
-1. **M2:** Add ROS 2 ↔ PX4 communication via uXRCE-DDS
-2. **M3:** Integrate simulated sensors (camera, depth, IMU)
-3. **M4+:** Implement mapping and exploration pipeline
+| Argument | Default | Effect |
+|---|---|---|
+| `world` | `share/simulation/worlds/simple_world.sdf` | World file (24 × 20 m walled arena) |
+| `headless` | `false` | `true`: no Gazebo GUI client (the server and swarm stack still run) |
+| `rviz` | `false` | Also start RViz2 mission control |
+| `sensor_profile` | `realtime` | Depth cameras: `realtime` = 160×120 @ 10 Hz, `full` = 320×240 @ 30 Hz (GPU hosts) |
+| `rgb_bridge` | `false` | Bridge the 640×480 RGB cameras to `/{ns}/camera/image` |
+| `lock_radius` | `2.0` | Algorithm 1 exclusion radius (m) |
+| `altitude` | `1.5` | Exploration altitude (m) |
 
-See `docs/development-roadmap.md` for full milestone details.
+## What starts, and when
+
+| Time | Action |
+|---|---|
+| t = 0 s | `gz sim -s -r --headless-rendering <world>`: physics server. Sensors render off-screen with EGL |
+| t = 0 s | `ros_gz_bridge` (odometry, pose, IMU, depth, `cmd_vel` / `enable`) and `clock_relay` (`/clock` at 100 Hz) |
+| t = 3 s | `ros_gz_sim create` spawns `drone_1` (−4, −6), `drone_2` (0, −6), `drone_3` (4, −6), facing +y |
+| t = 5 s | `coordination/launch/swarm_coordination.launch.py`: depth mappers, flight controllers, map merger, task allocator, RViz2 bridge, Gazebo overlay (not in headless mode) and RViz2 (`rviz:=true`) |
+| t = 7 s | `gz sim -g`: GUI client, unless `headless:=true`. It starts after spawning because a GUI that starts earlier can miss the spawned models |
+
+The drones arm and climb to the exploration altitude about 10–20 s after launch.
+
+Topics, rates and node parameters are listed in [`mdFiles/ros2-architecture.md`](../../mdFiles/ros2-architecture.md).
+To check that a running simulation is healthy, use the smoke test in
+[`docker/sim`](../../docker/sim/README.md#4-smoke-test) (`bash docker/sim/smoke_test.sh` also works outside Docker).
+
+## Legacy: PX4 SITL workflow
+
+The current stack flies the drones with Gazebo's `MulticopterVelocityControl`, not PX4.
+`simple_world.launch.py` and the `start_px4_*.sh` scripts belong to the earlier single-drone PX4 phase
+(see the historical M1 report, [`mdFiles/M1_README.md`](../../mdFiles/M1_README.md)). They are kept
+as the starting point for a PX4 offboard backend. Set `PX4_SOURCE_DIR` to your PX4-Autopilot checkout
+before using them.
 
 ## References
 
-- [Gazebo Harmonic Documentation](https://gazebosim.org/)
-- [PX4 SITL Guide](https://docs.px4.io/main/en/simulation/)
-- [ROS 2 Humble Documentation](https://docs.ros.org/en/humble/)
-- [Project Architecture](../docs/architecture.md)
-- [Simulation Configuration](../docs/simulation.md)
+- [Project README](../../README.md)
+- [Simulation design](../../mdFiles/simulation.md) · [Troubleshooting](../../mdFiles/troubleshooting.md)
+- [Gazebo Harmonic documentation](https://gazebosim.org/docs/harmonic)
+- [ROS 2 Jazzy documentation](https://docs.ros.org/en/jazzy/)

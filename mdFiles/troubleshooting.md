@@ -1,150 +1,236 @@
 # Troubleshooting
 
-General-purpose guide organized by symptom. Where a fix depends on the
-exact installed version of PX4, ROS 2, Gazebo, or the uXRCE-DDS agent, this
-is marked **VERSION-DEPENDENT** rather than stated as a fixed procedure —
-verify against the installed versions before applying.
+General-purpose guide for the current stack (ROS 2 Jazzy + Gazebo Harmonic,
+three drones, `run_gazebo_swarm.sh` / `gazebo_swarm.launch.py`), organized
+by symptom. Running instructions are in [`../README.md`](../README.md); the
+cloud-GPU container is documented in
+[`../docker/sim/README.md`](../docker/sim/README.md).
 
-## PX4 Not Starting
+## Quick Health Check
 
-* Confirm the PX4 SITL build target matches the installed Gazebo version
-  (Gazebo Harmonic support is **VERSION-DEPENDENT** on the PX4 release in
-  use — verify compatibility before debugging further).
-* Check for a stale PX4 build; a clean rebuild resolves many "won't start"
-  issues after a toolchain or dependency update.
-* Confirm no leftover PX4 SITL process is holding required ports from a
-  previous run.
+A healthy run looks like this:
 
-## Gazebo Not Starting
+* About 10–20 s after launch the flight controllers log `armed, taking off`
+  and then `at altitude, starting exploration`, and the drones climb to
+  1.5 m.
+* The task allocator logs `drone_i -> frontier (x, y)` lines.
+* Coverage keeps rising:
 
-* Confirm the world file referenced in the launch command exists at the
-  expected path under `simulation/worlds/`.
-* Check for GPU/rendering driver issues if Gazebo fails specifically at the
-  rendering stage rather than at world load.
-* Confirm Gazebo Harmonic (not an incompatible Gazebo Classic install) is
-  the one actually being invoked, if both are present on the system.
+```bash
+ros2 topic echo /swarm/metrics/coverage_pct
+```
 
-## ROS 2 Package Build Failures
+* Gazebo reports its real-time factor:
 
-* Confirm the package's `package.xml`/`CMakeLists.txt` dependencies are
-  installed (`rosdep install` against the workspace is the standard first
-  step).
-* Confirm the ROS 2 Humble environment is sourced before building with
-  `colcon`.
-* Isolate the failing package with `colcon build --packages-select
-  <name>` rather than rebuilding the whole workspace.
+```bash
+gz topic -e -t /stats
+```
 
-## DDS Communication Failures
+## Build Fails
 
-* Confirm the uXRCE-DDS agent is running and pointed at the correct
-  transport (serial vs. UDP) matching how PX4 SITL is configured — this
-  pairing is **VERSION-DEPENDENT** on the PX4 release's default transport.
-* Confirm ROS 2's DDS domain ID is consistent across all nodes; a mismatch
-  silently prevents nodes from seeing each other without an explicit error.
-* Confirm firewall/localhost networking isn't blocking DDS discovery
-  traffic if running across multiple processes/containers on the same
-  machine.
+* Use the launcher scripts, or build only the two packages the stack uses:
 
-## PX4 Topics Unavailable in ROS 2
+```bash
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select coordination simulation
+```
 
-* Confirm the uXRCE-DDS agent successfully established a session with the
-  PX4 SITL client (check agent logs for a connected-client message).
-* Confirm the specific topic is included in the active uXRCE-DDS
-  topic-mapping configuration — not all PX4 uORB topics are bridged to
-  ROS 2 by default. **VERSION-DEPENDENT** — check the mapping file shipped
-  with the installed PX4/uXRCE-DDS version.
-* Use `ros2 topic list` to confirm what is actually visible before assuming
-  a bridging configuration problem vs. a subscriber-side problem.
+* A bare `colcon build` fails by design: `src/control` depends on
+  `px4_msgs` and `src/localization` on `gazebo_ros`, and neither is
+  installed for this stack.
+* `Error: ROS 2 Jazzy not found in /opt/ros/jazzy`: install ROS 2 Jazzy and
+  `ros-jazzy-ros-gz` on Ubuntu 24.04. ROS 2 Humble pairs with Gazebo
+  Fortress and cannot run this stack.
 
-## Offboard Control Problems
+## `bad interpreter` or `$'\r': command not found`
 
-* Confirm setpoints are being streamed at or above PX4's required minimum
-  rate before attempting the mode switch into offboard — PX4 will reject
-  or exit offboard mode if setpoints stop arriving frequently enough.
-  **VERSION-DEPENDENT** exact rate — confirm against the installed PX4
-  version (see [`ros2-architecture.md`](ros2-architecture.md) §2.8).
-* Confirm the drone is armed before or as part of the offboard mode
-  transition, per PX4's expected arming/mode sequence.
-* Confirm the setpoint's coordinate frame matches what PX4 expects for
-  offboard position setpoints (see coordinate-frame problems below).
+* The scripts have Windows (CRLF) line endings. `.gitattributes` forces LF
+  for `*.sh`, `*.py`, `*.sdf`, `*.xml`, `*.rviz`, `*.cfg`, `*.yaml` and
+  `*.txt`, but files checked out before it existed, or edited with a
+  Windows editor that writes CRLF, can still carry them.
+* Fix a single file inside WSL:
 
-## Drone Not Moving
+```bash
+sed -i 's/\r$//' run_gazebo_swarm.sh run_single_window.sh
+```
 
-* Confirm PX4 is actually armed and in offboard mode (not still in a
-  manual/hold mode) — a very common cause of "waypoint sent but nothing
-  happens."
-* Confirm the PX4 Interface Node is receiving a valid waypoint at all
-  (log it) before assuming the flight-control side is at fault.
-* Confirm Gazebo physics is not paused.
+* To re-normalize the whole checkout, first commit or stash your work,
+  then re-check out the files so the `.gitattributes` rules apply.
 
-## Map Not Updating
+## Windows Launcher Does Nothing
 
-* Confirm the Mapping Node is actually receiving both a current pose
-  estimate and depth/sensor data — a stale or missing pose is a common
-  silent cause (see [`system-design.md`](system-design.md) §8, "pose
-  estimate unavailable or stale").
-* Confirm depth sensor topic is publishing (`ros2 topic hz`) before
-  assuming a mapping-logic bug.
-* Confirm the map is not being reset/reinitialized unintentionally on each
-  update cycle.
+* `run_gazebo_swarm.ps1` and `run_single_window.ps1` call
+  `wsl -d Ubuntu`. Your WSL distribution must be named `Ubuntu`
+  (`wsl -l -v` lists the names). Otherwise run the `.sh` scripts from a
+  WSL shell.
 
-## Frontier Detector Finding Nothing
+## Simulation Runs Slowly (Low Real-Time Factor)
 
-* Confirm the occupancy grid actually contains a mix of FREE, OCCUPIED,
-  and UNKNOWN cells — if the map is entirely UNKNOWN (nothing observed
-  yet) or entirely FREE/OCCUPIED (fully explored), zero frontiers is the
-  *correct* result, not a bug.
-* Confirm the adjacency/connectivity definition used in detection isn't
-  overly strict in a way that misses valid boundary cells (see
-  [`exploration.md`](exploration.md) §2).
-* Confirm map bounds/edges aren't being treated as artificial frontiers or
-  artificial non-frontiers incorrectly — edge-of-map handling is a common
-  off-by-one source.
+* Under WSL2 about 0.6–0.75× real time is expected. Depth cameras are
+  rendered in software. Nodes use simulation time, so behaviour does not
+  change; only the wall clock is slower.
+* Keep the default `sensor_profile:=realtime` (160×120 @ 10 Hz depth) on a
+  laptop. `sensor_profile:=full` is meant for GPU hosts.
+* Leave `rgb_bridge:=false`. Once the RGB cameras are bridged, Gazebo
+  renders all three at 640×480 @ 30 Hz.
+* Check for a second Gazebo server from an earlier run (next section). Two
+  servers compete for CPU and both publish a clock.
+* **WSL GPU:** the launch file does not force the d3d12 (WSL GPU) render
+  path, because in our tests it was slower than llvmpipe for depth-sensor
+  read-back. Forcing it is not a fix for low RTF.
 
-## Invalid Waypoint
+## Stale Gazebo Processes
 
-* Confirm the representative point chosen from the cluster is being
-  correctly snapped to a FREE cell, not left on/near the FREE/UNKNOWN
-  boundary (see [`exploration.md`](exploration.md) §6).
-* Confirm the clearance check is using the same, current occupancy grid
-  the rest of the pipeline is using, not a stale snapshot.
-* Confirm the waypoint's coordinate frame matches what downstream (PX4
-  Interface Node) expects.
+* `run_gazebo_swarm.sh` stops leftover `gz sim` and `parameter_bridge`
+  processes before launching. If a run was killed uncleanly and you start
+  the launch file directly, clean up by hand:
 
-## VSLAM Failure
+```bash
+pgrep -af "gz sim|parameter_bridge"
+pkill -INT -f "^gz sim"; sleep 3; pkill -9 -f "^gz sim"
+pkill -9 -f "ros_gz_bridge|parameter_bridge"
+```
 
-* Confirm the environment has sufficient visual texture — texture-poor
-  Gazebo worlds are a known stress case for VSLAM/VIO tracking (see
-  [`simulation.md`](simulation.md) §5).
-* Confirm camera and IMU data are correctly time-synchronized; VIO is
-  highly sensitive to timestamp misalignment between the two streams.
-* Confirm this failure is isolated to localization and not actually a
-  downstream mapping/exploration bug being misattributed — this is
-  exactly the class of ambiguity the ground-truth-first strategy (see
-  [`localization.md`](localization.md) §4) is designed to avoid. If in
-  doubt, re-run the same scenario in ground-truth mode to confirm the rest
-  of the pipeline is healthy.
+## A Drone Is Missing from the Gazebo Window
 
-## RViz Problems
+* The GUI client starts at t = 7 s, after the drones are spawned at
+  t = 3 s. A GUI client that is still initialising when a model is created
+  can miss it and never draw it. This can happen on a heavily loaded
+  machine, or if you open a GUI yourself before spawning finishes.
+* Close the Gazebo window (the server keeps running) and open a new client
+  from the repository root:
 
-* Confirm the RViz2 fixed frame is set to the correct map frame (see
-  [`system-design.md`](system-design.md) §6) — a mismatched fixed frame is
-  the most common cause of "nothing shows up" in RViz2.
-* Confirm the relevant topics (occupancy grid, frontier markers, pose) are
-  actually being published before assuming a display-configuration issue.
+```bash
+source /opt/ros/jazzy/setup.bash
+gz sim -g --gui-config simulation/gui/swarm_gui.config
+```
 
-## Coordinate-Frame Problems
+* The overlay (merged map, frontiers, rings, HUD) is drawn by
+  `coordination/gz_overlay.py` through the GUI's MarkerManager plugin. It is
+  disabled with `headless:=true`.
 
-* Confirm all components agree on the same map frame name and definition
-  (see [`system-design.md`](system-design.md) §6 and
-  [`localization.md`](localization.md) §7) — this is a common source of
-  silent misalignment (map appears "shifted" or "rotated" relative to the
-  real world, sensor data appears offset from the drone's visualized
-  position).
-* Confirm the transform tree (map → odom → base_link, or equivalent) is
-  fully published and consistent; a missing or duplicate transform
-  publisher is a common cause of intermittent frame-lookup failures.
-* When switching from ground-truth pose to VSLAM/VIO (M11), re-verify the
-  frame contract hasn't silently changed — see
-  [`localization.md`](localization.md) §6 on why this interface must stay
-  fixed across that transition.
+## Drones Do Not Take Off
+
+* Wait 10–20 s. The swarm stack starts at t = 5 s, and each flight
+  controller only arms after the bridge has subscribed to `/{ns}/enable`.
+* Check that the drones exist and are publishing state:
+
+```bash
+ros2 topic hz /drone_1/odom
+ros2 topic echo /drone_1/enable --once
+```
+
+* If `/clock` is missing, nothing advances: all nodes run with
+  `use_sim_time:=true`. Check `ros2 topic hz /clock` (≤ 100 Hz from
+  `clock_relay`).
+
+## No Messages on a Topic
+
+* Run the smoke test. It lists missing, silent and slow topics and the
+  real-time factor. In the Docker container:
+
+```bash
+docker exec -it swarm_sim_cloud smoke-test
+```
+
+* On a native or WSL install, run it from a sourced shell. It defaults to
+  the `full` profile and a minimum RTF of 0.8, so for a laptop run pass:
+
+```bash
+source /opt/ros/jazzy/setup.bash && source install/setup.bash
+python3 docker/sim/smoke_test.py --profile realtime --min-rtf 0
+```
+
+* Minimum sim-time rates: odom 28 Hz, imu 190 Hz, ground_truth_pose
+  28 Hz, map and `/global_map` 1.8 Hz, depth 28 Hz (`full`) or 9 Hz
+  (`realtime`), RTF 0.8.
+* If topics are missing in every shell, check that all terminals use the
+  same `ROS_DOMAIN_ID`.
+
+## Map or Coverage Not Updating
+
+* The depth mapper ignores frames while the drone is below 0.8 m and
+  returns closer than 0.35 m (its own propellers). Mapping starts once the
+  drones have climbed.
+* Check the per-drone maps and the merged map:
+
+```bash
+ros2 topic hz /drone_1/map
+ros2 topic hz /global_map
+```
+
+* If the drone maps but the merged map stays empty, check that
+  `map_merger` is running (`ros2 node list`).
+
+## Exploration Stops Early or a Drone Hovers
+
+* `EXPLORATION COMPLETE: no frontiers left, drones holding position` is the
+  normal end of a run.
+* A drone that makes no progress towards its target for 20 s has that
+  target blacklisted (`blacklisting target` warning) and gets a new one.
+* A flight controller holds position if no `cmd_pose` arrives for 2 s.
+  Check `ros2 topic hz /drone_1/cmd_pose` (1 Hz).
+
+## High Overlap Rate
+
+* An overlap of about 30–45 % at 90 % coverage is the current, expected
+  behaviour, not a bug. The 87° depth cameras see much of the 24 × 20 m
+  room from almost anywhere. Algorithm 1 keeps targets and paths apart,
+  not sensor footprints. See [`evaluation.md`](evaluation.md).
+
+## RViz Shows Nothing
+
+* RViz2 only starts with `rviz:=true`. The RViz-only markers and TF
+  (`swarm_sim_bridge`) are also only started then.
+* The fixed frame is `map`. Confirm `/global_map` is publishing before
+  assuming a display problem.
+
+## Docker: Rendering on the CPU (llvmpipe)
+
+* Run the bundled check inside the container:
+
+```bash
+docker exec -it swarm_sim_cloud check-gpu
+```
+
+* The `GL_RENDERER` lines from `~/.gz/rendering/ogre2.log` should name the
+  NVIDIA GPU. `llvmpipe` means software rendering, which usually means the
+  container started without `--gpus all` or the NVIDIA Container Toolkit
+  is missing. Verify the toolkit on the host:
+
+```bash
+docker run --rm --gpus all ubuntu nvidia-smi
+```
+
+* If the Gazebo window does not appear in viewer mode, rule out VirtualGL:
+
+```bash
+VGLRUN=0 bash docker/sim/run_docker.sh
+```
+
+## Docker: Cannot Open the Browser Desktop
+
+* The noVNC desktop is on port 6080 (`NOVNC_PORT` changes the host port).
+  It is only published in viewer mode: `headless:=true` without
+  `rviz:=true` publishes no port.
+* The generated password is printed at start-up. With `--detach`, read it
+  from the logs:
+
+```bash
+docker logs swarm_sim_cloud 2>&1 | grep "VNC password"
+```
+
+* Only the first 8 characters of the password count. Set your own with
+  `VNC_PASSWORD=...`.
+* With `BIND_ADDR=127.0.0.1` the port is only reachable through an SSH
+  tunnel (`ssh -L 6080:localhost:6080 user@<server-ip>`). Otherwise allow
+  TCP 6080 in the firewall or security group, from your own IP only.
+
+## Future PX4 Backend
+
+* PX4 SITL, uXRCE-DDS and MAVROS are not part of the current stack: the
+  drones fly on Gazebo's `MulticopterVelocityControl`. The legacy scripts
+  `simulation/launch/start_px4_sitl.sh` and `start_px4_swarm.sh` and the
+  `src/control` package (which needs `px4_msgs`) are the starting points
+  for a PX4 offboard backend. Troubleshooting for that path will be added
+  when it is wired in (see [`development-roadmap.md`](development-roadmap.md)).

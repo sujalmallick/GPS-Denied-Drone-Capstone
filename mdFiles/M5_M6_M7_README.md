@@ -1,5 +1,7 @@
 # M5-M7: Frontier Detection, Clustering, and Selection
 
+> **Historical milestone report (Phase 1, single drone).** This document records the earlier single-drone PX4 SITL + ROS 2 Humble phase and the C++ packages in `src/`. The current system is the three-drone ROS 2 Jazzy + Gazebo Harmonic swarm described in [../README.md](../README.md) and [README.md](README.md). Commands and results below are kept for reference and may no longer run as written.
+
 **Status:** ✅ **IMPLEMENTATION COMPLETE**  
 **Date:** 2026-08-22  
 **Milestones:**

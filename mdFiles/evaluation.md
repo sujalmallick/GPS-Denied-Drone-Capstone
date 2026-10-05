@@ -1,61 +1,128 @@
 # Evaluation
 
-Evaluation is implemented at milestone M12, using Python, NumPy, Pandas,
-and Matplotlib against logged data from exploration runs. This document
-defines the metrics and how each is measured; it does not implement the
-evaluation code.
+This document defines how the three-drone swarm is evaluated, the targets
+the project set, and what can be measured today. There are two separate
+sources of numbers:
+
+* **(a) Live metrics.** These are real: they are computed from the running
+  simulation (§2).
+* **(b) Offline pipeline** (`validation/`). This is currently a placeholder
+  and mock-up. Its numbers must not be cited (§4).
 
 ## 1. Metrics
 
-| Metric | Definition | How Measured |
+| Metric | Definition | Source |
 |---|---|---|
-| Exploration coverage | Fraction of the (estimable) total explorable area that has been marked FREE or OCCUPIED by the end of the run | `(FREE_cells + OCCUPIED_cells) / total_explorable_cells`, computed from the final occupancy grid; `total_explorable_cells` estimated from the known world bounds/geometry for evaluation purposes only |
-| Exploration time | Wall-clock or simulated time from mission start to exploration-complete | Timestamp difference between run start and the exploration-complete event logged by the Exploration Manager |
-| Total distance traveled | Cumulative path length flown by the drone | Sum of per-tick displacement magnitudes from the logged pose trajectory |
-| Number of waypoints | Count of waypoints generated and/or successfully reached | Count of waypoint-generation and waypoint-arrival events in the run log |
-| Unexplored area | Fraction of the map still UNKNOWN at run end | `UNKNOWN_cells / total_cells` from the final occupancy grid |
-| Redundant exploration | Degree to which the drone revisits already-FREE areas without gaining new coverage | Fraction of flight time/distance spent in cells that were already FREE at the time of traversal, vs. cells that transitioned FREE for the first time |
-| Computational time | Per-stage processing latency (mapping update, frontier detection, clustering, scoring, waypoint generation) | Wall-clock timing instrumentation around each pipeline stage, logged per invocation |
-| Map quality | Accuracy of the built occupancy grid relative to the true world geometry | Comparison of final occupancy grid against Gazebo's known ground-truth world geometry (available in simulation only, for evaluation purposes) — e.g., cell-wise agreement rate |
-| Localization error | Deviation of the pose estimate from Gazebo ground truth | Position error (e.g., Euclidean distance) between VSLAM/VIO pose and ground-truth pose at matched timestamps, logged throughout the run (ground truth used only as an offline evaluation reference, never fed into the autonomy pipeline post-M11 — see [`localization.md`](localization.md)) |
-| Collision count | Number of collision events during the run | Collision events reported by Gazebo's physics/contact sensing, counted from the run log |
+| Coverage | Known cells (free or occupied) inside the arena bounds ÷ arena cells × 100 % | Live: `/swarm/metrics/coverage_pct` |
+| Overlap rate | Cells observed by **≥ 2** drones ÷ cells observed by ≥ 1 drone × 100 % | Live: `/swarm/metrics/overlap_rate` |
+| Real-time factor | Simulated time ÷ wall time | Live: Gazebo `/stats`, smoke test |
+| Topic rates | Messages per second of simulated time | Live: smoke test |
+| Exploration time | Simulated time from launch to the allocator's `EXPLORATION COMPLETE` log line | Live: run log + `/clock` |
+| ATE RMSE | $\sqrt{\tfrac{1}{N}\sum \lVert p^{gt}_i - p^{est}_i \rVert^2}$ per drone, plus yaw RMSE | Offline: `validation/validate.py`. Not meaningful yet (§3) |
 
-## 2. Measurement Methodology
+Coverage and overlap are computed by `coordination/map_merger.py` at 2 Hz on
+the 0.2 m, 200 × 200 grids, with arena bounds `[-12, 12, -9, 11]` m. The
+formulas are `coverage_pct` and `overlap_rate` in
+`coordination/algorithms.py` and are covered by
+`coordination/test_swarm_coordination.py`.
 
-* All metrics are computed from **logged data**, not recomputed live during
-  the run — the exploration stack should log the necessary raw data
-  (pose trajectory, occupancy grid snapshots, event timestamps, per-stage
-  timing) during execution, and `evaluation/` scripts consume these logs
-  after the fact.
-* Ground-truth data (world geometry, ground-truth pose) is available only
-  because this is a simulation; it is used exclusively for evaluation and
-  must never be fed back into the autonomy pipeline once M11 is
-  implemented (see [`localization.md`](localization.md) §4).
-* Runs used for evaluation should use deterministic, documented world
-  configurations (see [`simulation.md`](simulation.md) §5) so results are
-  reproducible and comparable across code changes.
-* Each metric should be computed per-run, with support for aggregating
-  across multiple runs (e.g., mean/variance across repeated episodes in the
-  same world, or across different worlds) once enough runs exist.
+**Overlap definition mismatch.** The `validate.py` docstring (its "Eq 12")
+defines overlap as cells seen by *all three* drones over cells seen by any
+drone. The live metric counts cells seen by *two or more* drones. This
+document and the README use the code's live definition. The offline
+definition gives lower numbers and should be aligned with the live one.
 
-## 3. Output Format
+## 2. Live Metrics (Real)
 
-Evaluation scripts should produce:
+```bash
+ros2 topic echo /swarm/metrics/coverage_pct
+ros2 topic echo /swarm/metrics/overlap_rate
+gz topic -e -t /stats
+```
 
-* A per-run metrics table (e.g., a Pandas DataFrame, exportable to CSV).
-* Plots (Matplotlib) for time-series metrics where useful — e.g., coverage
-  over time, localization error over time/distance.
-* A human-readable summary suitable for inclusion in a milestone report
-  when M12 is completed.
+The smoke test checks topic rates against simulated time and the
+real-time factor. Minimums: odom 28 Hz, imu 190 Hz, ground_truth_pose
+28 Hz, map and `/global_map` 1.8 Hz, depth 28 Hz (`full`) or 9 Hz
+(`realtime`), RTF 0.8. On a laptop, turn the RTF check off:
 
-Exact file formats/paths under `evaluation/` are an implementation detail
-to be decided at M12 and are not fixed by this document.
+```bash
+python3 docker/sim/smoke_test.py --profile realtime --min-rtf 0
+```
 
-## 4. Future Baseline Comparisons
+In the Docker container, run `docker exec -it swarm_sim_cloud smoke-test`
+(see [`../docker/sim/README.md`](../docker/sim/README.md)).
 
-The single-drone metrics defined above are intended to serve as the
-baseline against which the future swarm/multi-drone phase (see
-[`development-roadmap.md`](development-roadmap.md), "Future Phase") is
-compared. When that phase begins, additional multi-agent metrics (overlap,
-workload balance, communication overhead, scalability) will be layered on
-top of this same measurement methodology, not implemented now.
+To keep a run for later analysis, record the live topics:
+
+```bash
+ros2 bag record /clock /global_map /swarm/metrics/coverage_pct /swarm/metrics/overlap_rate \
+  /drone_1/ground_truth_pose /drone_2/ground_truth_pose /drone_3/ground_truth_pose
+```
+
+## 3. Targets vs. Current Behaviour
+
+| Metric | Target (team plan) | Current behaviour |
+|---|---|---|
+| Coverage | > 90 % | Reported as reached (not yet backed by a recorded run): [`../README.md`](../README.md) reports coverage typically passing 90 % in about 40 s of simulated time, followed by `EXPLORATION COMPLETE` |
+| Overlap rate | < 5 % | **Not met** under the live definition: about 30–45 % by the time coverage reaches 90 % |
+| ATE RMSE | < 0.10 m | **Not meaningful yet**: the stack uses Gazebo ground-truth odometry, so there is no estimated pose to compare |
+| Real-time factor | ≥ 0.8 (smoke test) | About 0.6–0.75× under WSL2. Real time on an NVIDIA GPU host is expected but not yet verified |
+
+The coverage, overlap and ATE targets come from
+`CONTRIBUTING_SWARM_WORKSTREAMS.md`.
+
+**Why overlap is high.** The forward depth cameras have an 87° field of
+view and the depth mapper uses an 8 m range, so in a 24 m × 20 m room a
+drone sees much of the room from almost anywhere. Algorithm 1 keeps the
+drones' *targets and paths* apart, using 2.0 m exclusion zones and gain
+discounting. It does not keep sensor footprints apart, which is what
+cell overlap measures. A task-level overlap metric, such as target or
+path conflicts, would match the design's guarantee better. That is future
+work.
+
+## 4. Offline Pipeline (Placeholder)
+
+```bash
+python3 validation/parse_rosbag.py --name <path_to_bag>
+python3 validation/validate.py --dir validation/output
+```
+
+Do not cite the output of these scripts as results. In the current code:
+
+* `parse_rosbag.py` ignores the bag. It always writes synthetic circular
+  trajectories with added noise to
+  `validation/output/drone_*_trajectory.csv`. Its docstring names the
+  topics `/drone_N/ground_truth/pose` and
+  `/drone_N/visual_slam/tracking/vo_pose_covariance`. The first does not
+  match the bridged `/{ns}/ground_truth_pose`, and nothing publishes the
+  second yet.
+* `validate.py` computes ATE and yaw RMSE from those synthetic CSVs. The
+  pose alignment and time interpolation described in its docstring are
+  not implemented. The coverage curve (94.6 %), the overlap bars (1.84 %
+  vs. 24.3 %) and the "2.74x" speedup are hard-coded, and it prints
+  `PASS` whatever the inputs are.
+
+Before its numbers can be cited, the pipeline needs:
+
+* real bag parsing (ground truth plus an estimated pose, and
+  `/swarm/metrics/*`);
+* time synchronisation and pose alignment;
+* metrics computed from the data, including the live overlap definition;
+* target checks that can fail.
+
+This is roadmap item N4 in [`development-roadmap.md`](development-roadmap.md).
+
+## 5. Methodology
+
+* All nodes run on simulation time, so metrics are reported against
+  simulated time. A lower real-time factor changes wall-clock duration,
+  not the result.
+* Use the default world (`simulation/worlds/simple_world.sdf`) and the
+  fixed spawn points so runs are comparable (see
+  [`simulation.md`](simulation.md)). Record `sensor_profile`,
+  `lock_radius` and `altitude` with each run.
+* Ground truth is an evaluation reference only. Once VSLAM/VIO replaces
+  ground-truth odometry, ground truth must not feed the autonomy stack.
+* Planned comparisons, none of them run yet: swarm vs. a single drone
+  (time to 90 % coverage), Algorithm 1 vs. uncoordinated allocation, a
+  `lock_radius` sweep, and per-drone ATE with an estimated pose.

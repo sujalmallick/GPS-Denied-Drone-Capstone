@@ -1,171 +1,199 @@
 # Algorithms
 
-Per-algorithm specification for every algorithmic component in the
-pipeline. See [`exploration.md`](exploration.md) and
-[`mapping.md`](mapping.md) for the narrative/architectural context this
-summarizes into an implementation-focused reference.
+Per-algorithm reference for the swarm pipeline as implemented. All
+algorithms except pose and control live in `coordination/algorithms.py`
+(pure numpy, no `rclpy`), are unit-tested in
+`coordination/test_swarm_coordination.py`, and are called unchanged by the
+ROS 2 nodes. [`mapping.md`](mapping.md), [`exploration.md`](exploration.md)
+and [`localization.md`](localization.md) give the narrative context;
+[`../README.md`](../README.md) has the system overview.
 
-## 1. Pose Estimation
+Complexities use $W \times H$ for the grid (200 × 200), $K$ for drones (3),
+$F$ for frontier cells and $C$ for clusters.
 
-* **Input:** Ground-truth pose topic (dev mode) OR camera + IMU streams
-  (VSLAM/VIO mode, from M11).
-* **Output:** Pose estimate (position + orientation) in the map frame.
-* **Logic:** Dev mode simply republishes/relays Gazebo's ground-truth pose.
-  VSLAM/VIO mode runs visual-inertial odometry (e.g., ORB-SLAM3) to fuse
-  camera and IMU data into a pose estimate; see
-  [`localization.md`](localization.md) for candidate selection.
-* **Complexity:** Ground truth: O(1) per update. VSLAM/VIO: dominated by
-  the chosen library's per-frame feature extraction/tracking cost —
-  library-dependent, not specified here.
-* **Assumptions:** A single pose source is active at a time; both modes
-  publish on the same topic/frame contract.
-* **Limitations:** Ground truth is unrealistic (perfect) and only valid for
-  development. VSLAM/VIO is subject to drift and can lose tracking in
-  low-texture or fast-motion scenarios.
-* **Future improvements:** Loop closure / full SLAM (not just VIO) to
-  bound drift; sensor fusion with additional modalities if added later.
+## Parameters at a Glance
 
-## 2. Occupancy Mapping
+| Constant | Value | Where |
+|---|---|---|
+| Grid | 200 × 200 cells, 0.2 m, origin $(-20, -20)$ | `depth_mapper` |
+| Depth range used | 0.35 – 8 m, obstacle band $0.3 \le z \le 2.7$ m | `depth_mapper` |
+| Log-odds | $l_{\text{occ}} = 0.85$, $l_{\text{free}} = -0.4$, clamp $[-2.0, 3.5]$, thresholds occ $\ge 0.5$ / free $\le -0.3$ | `OccupancyLogOdds` |
+| Teammate filter | 0.6 m | `depth_mapper` |
+| Fusion occupied threshold | 65 | `OCCUPIED_THRESHOLD` |
+| Frontier clearance | 0.4 m | `task_allocator` |
+| Min cluster size | 5 cells | `task_allocator` (function default 3) |
+| Utility weights | $\alpha = \beta = 1$ | `task_allocator` |
+| Sensor radius (discount) | 5.0 m | `task_allocator` |
+| Lock (exclusion) radius | 2.0 m | `task_allocator`, launch arg `lock_radius` |
+| Arrival radius | 0.8 m | `task_allocator` |
+| Progress watchdog | 20 s without getting 0.5 m closer; blacklist radius 1.0 m | `task_allocator` |
+| Min commit time | 5 s | `task_allocator` |
+| A* inflation / unknown cost | 0.5 m / 2× | `flight_controller`, `plan_path` |
+| Cruise speed / lookahead | 0.8 m/s / 0.8 m | `flight_controller` |
+| Separation radius | 1.5 m | `flight_controller` |
+| Command timeout | 2 s | `flight_controller` |
+| Altitude | 1.5 m | launch arg `altitude` |
 
-* **Input:** Pose estimate, depth/point-cloud observation.
-* **Output:** Updated occupancy grid (FREE/OCCUPIED/UNKNOWN per cell).
-* **Logic:** Transform observation into map frame using current pose;
-  ray-cast from sensor origin to each observed point, marking traversed
-  cells FREE and the terminal cell OCCUPIED. See
-  [`mapping.md`](mapping.md) §2 for full pseudocode.
-* **Complexity:** O(N) per observation, where N is the number of
-  observed points times the average ray length in cells.
-* **Assumptions:** Pose is valid and time-aligned with the sensor
-  observation; depth sensor provides metrically accurate range data.
-* **Limitations:** Errors in pose (e.g., late-stage VSLAM drift) directly
-  corrupt the map; no explicit handling of dynamic obstacles (the
-  environment is assumed static within Phase 1's scope).
-* **Future improvements:** Probabilistic (log-odds) cell updates instead of
-  binary/ternary updates; 3D voxel mapping (see
-  [`mapping.md`](mapping.md) §9); dynamic-obstacle handling.
+## 1. Pose Source
 
-## 3. Frontier Detection
+* **Input:** `/{ns}/odom` (`nav_msgs/Odometry`, world frame `map`, 30 Hz).
+* **Output:** Position and orientation used by every node.
+* **Logic:** Currently Gazebo's `OdometryPublisher`, i.e. exact ground
+  truth. No estimator runs. See [`localization.md`](localization.md) for
+  the GPS-denied replacement path (VIO / VSLAM / PX4 EKF2 vision fusion).
+* **Limitations:** Perfect pose hides the drift and frame-alignment
+  problems a real estimator introduces.
 
-* **Input:** Occupancy grid.
-* **Output:** Set of frontier cells.
-* **Logic:** A FREE cell is a frontier cell if any adjacent cell is
-  UNKNOWN. See [`exploration.md`](exploration.md) §2.
-* **Complexity:** O(W×H) for a W×H grid with a full scan; can be reduced to
-  amortized near-O(changed cells) with an incremental approach that only
-  re-checks cells whose state changed since the last update — worth
-  considering if full-grid scans become a performance bottleneck.
-* **Assumptions:** Grid connectivity (4- vs 8-adjacency) is fixed and
-  consistent with the clustering step.
-* **Limitations:** Naive full-grid scanning is wasteful on large, mostly-
-  explored maps.
-* **Future improvements:** Incremental frontier maintenance instead of
-  full-grid rescans; spatial indexing for large maps.
+## 2. Depth Image to Rays (`depth_image_to_rays`)
 
-## 4. Frontier Clustering
+* **Input:** `32FC1` depth image, horizontal FOV (1.5184 rad), camera
+  offset (0.13 m forward), drone rotation and position.
+* **Output:** Sensor origin, per-column azimuth and free length, obstacle
+  hit points.
+* **Logic:** Sample every `stride`-th pixel (about 80 columns per frame);
+  back-project with $f_x = \frac{w/2}{\tan(\text{hfov}/2)}$; drop returns
+  below 0.35 m and at the far clip; keep points with
+  $0.3 \le z \le 2.7$ m as obstacles; the nearest obstacle per column is
+  the hit; free space runs to the hit or to 8 m. Floor-only columns are
+  free only up to the farthest floor point seen.
+* **Complexity:** $O(V \cdot U)$ for $V \times U$ sampled pixels.
+* **Assumptions:** Planar (z-buffer) depth, camera looking along body $+x$.
+* **Limitations:** Collapses 3D to one range per column; overhangs outside
+  the band are invisible.
+* **Tests:** `test_depth_rays_map_wall_ahead`, `test_depth_rays_ignore_own_propellers`.
 
-* **Input:** Set of frontier cells.
-* **Output:** List of clusters (connected groups) with member cells.
-* **Logic:** Connected-component labeling over the frontier-cell set using
-  a fixed connectivity definition; discard clusters below
-  `min_cluster_size`. See [`exploration.md`](exploration.md) §3.
-* **Complexity:** O(F) for F frontier cells using a standard
-  union-find or flood-fill connected-components algorithm.
-* **Assumptions:** Connectivity definition matches frontier detection's
-  adjacency definition.
-* **Limitations:** Simple connectivity-based clustering can merge frontiers
-  that are geometrically close but conceptually distinct (e.g., across a
-  thin wall gap) or split frontiers that a human would consider one region
-  if there's a one-cell gap.
-* **Future improvements:** Distance-based or hierarchical clustering as an
-  alternative to pure connectivity; merging/splitting heuristics tuned
-  against real exploration runs.
+## 3. Log-Odds Occupancy (`OccupancyLogOdds`)
 
-## 5. Frontier Scoring
+* **Input:** Rays from §2.
+* **Output:** Local grid with values $\{-1, 0, 100\}$, published on `/{ns}/map` at 2 Hz.
+* **Logic:** Cells along each ray (sampled every 0.1 m, stopping half a
+  cell before the hit) get $l_{\text{free}} = -0.4$; hit cells get
+  $l_{\text{occ}} = +0.85$; each cell updates at most once per frame, and
+  values are clipped to $[-2.0, 3.5]$. Publish 100 if $l \ge 0.5$, 0 if
+  $l \le -0.3$, otherwise −1. Hits within 0.6 m of a teammate are dropped
+  before integration; frames below 0.8 m altitude are skipped.
+* **Complexity:** $O(R \cdot S)$ per frame for $R$ rays of $S$ samples.
+* **Limitations:** Static-world assumption; no time alignment between the
+  depth frame and the pose (the latest odometry is used).
 
-* **Input:** List of clusters, current drone pose.
-* **Output:** Each cluster annotated with a scalar score.
-* **Logic:** `score = information_gain - distance_cost` (optionally
-  `- safety_cost`, see [`exploration.md`](exploration.md) §4.3). Both
-  terms are individually swappable functions.
-* **Complexity:** O(C) for C clusters, assuming O(1) or O(cluster size)
-  per-cluster gain/cost computation.
-* **Assumptions:** `information_gain` and `distance_cost` are expressed in
-  comparable, weighted units (see weight parameters in
-  [`ros2-architecture.md`](ros2-architecture.md) §2.5) so neither term
-  trivially dominates.
-* **Limitations:** The initial information-gain estimate (cluster size /
-  adjacent unknown area) is a heuristic, not a true expected-information
-  computation (e.g., ray-casting-based visibility estimation).
-* **Future improvements:** Ray-casting-based information-gain estimation;
-  learned or adaptive scoring weights; explicit safety-cost term.
+## 4. Conservative Map Fusion (`fuse_occupancy`)
 
-## 6. Frontier Selection
+* **Input:** $K$ local grids with identical geometry.
+* **Output:** `/global_map` (latched, 2 Hz).
+* **Logic:**
 
-* **Input:** Scored, filtered (valid) clusters.
-* **Output:** A single selected cluster, or `None`.
-* **Logic:** Argmax over score among valid clusters. See
-  [`exploration.md`](exploration.md) §5.
-* **Complexity:** O(C) for C valid clusters.
-* **Assumptions:** Ties are broken deterministically (e.g., by cluster ID
-  or centroid position) to keep runs reproducible for evaluation.
-* **Limitations:** Purely greedy, single-step-ahead selection; does not
-  plan multiple exploration steps ahead.
-* **Future improvements:** Multi-step lookahead / sequencing of frontier
-  visits; re-scoring previously-rejected clusters as the map changes.
+$$M_{\text{global}}(c) = \begin{cases}
+100 & \text{if } \exists i : M_i(c) \ge 65 \quad \text{(obstacle priority)} \\
+0 & \text{if every drone that observed } c \text{ reports } 0 \text{ (at least one did)} \\
+-1 & \text{otherwise}
+\end{cases}$$
 
-## 7. Waypoint Generation
+* **Complexity:** $O(K \cdot W \cdot H)$.
+* **Assumptions:** All local maps share one world frame (true while pose is
+  ground truth). Maps with a different geometry are rejected.
+* **Limitations:** Any misalignment between drones survives as phantom
+  obstacles. That is safe, but it can block passages.
+* **Tests:** `test_conservative_map_fusion`.
 
-* **Input:** Selected cluster.
-* **Output:** Validated waypoint (position + frame), or a rejection signal.
-* **Logic:** Pick a representative point, verify it is FREE (or snap to the
-  nearest FREE point), verify clearance from OCCUPIED cells meets a
-  configured minimum. See [`exploration.md`](exploration.md) §6.
-* **Complexity:** O(1) for the representative-point pick; O(k) for a local
-  clearance check over a k-cell neighborhood.
-* **Assumptions:** The occupancy grid used for validation is reasonably
-  current (not from a stale map snapshot).
-* **Limitations:** Purely local clearance check; does not verify a
-  collision-free path to the waypoint, only that the waypoint itself is
-  safe.
-* **Future improvements:** Full path validation/planning between current
-  position and the waypoint, not just endpoint validation.
+## 5. Swarm Metrics (`coverage_pct`, `overlap_rate`)
 
-## 8. Navigation
+* **Coverage:** known cells inside the arena $[-12, 12] \times [-9, 11]$ m ÷ arena cells × 100 %.
+* **Overlap:** cells observed by ≥ 2 drones ÷ cells observed by ≥ 1 drone × 100 %.
+* **Complexity:** $O(K \cdot W \cdot H)$.
+* **Tests:** `test_coverage_and_overlap_metrics`, `test_region_mask_matches_bounds`.
 
-* **Input:** Validated waypoint.
-* **Output:** Drone motion toward the waypoint; arrival confirmation.
-* **Logic:** PX4 Interface Node streams the waypoint as an offboard
-  setpoint at the rate PX4 requires; arrival is declared when the drone's
-  pose is within a configured tolerance of the waypoint. See
-  [`ros2-architecture.md`](ros2-architecture.md) §2.8.
-* **Complexity:** O(1) per control-loop tick.
-* **Assumptions:** PX4 is in offboard mode and armed; setpoints are
-  streamed continuously enough to avoid PX4 falling back out of offboard
-  mode.
-* **Limitations:** No dynamic obstacle avoidance beyond what the
-  already-validated waypoint provides; a straight-line/PX4-internal path to
-  the setpoint is assumed safe because the map was checked, not because a
-  path was explicitly planned.
-* **Future improvements:** Explicit local path planning with obstacle
-  avoidance between current position and waypoint, rather than relying on
-  PX4's internal position controller alone.
+## 6. Frontier Detection (`frontier_mask`)
 
-## 9. Exploration Termination
+* **Input:** Fused grid.
+* **Output:** Boolean frontier mask.
+* **Logic:** $F = \{c \mid M(c)=0 \wedge \exists n \in N_8(c): M(n)=-1\}$,
+  computed with 8 shifted array comparisons; the border is padded as
+  occupied. `task_allocator` then removes cells within 0.4 m of an obstacle
+  or outside the arena shrunk by 0.4 m.
+* **Complexity:** $O(W \cdot H)$ per cycle (full rescan, vectorized).
+* **Future improvements:** Incremental updates over changed cells only.
 
-* **Input:** Current exploration state (frontier set, coverage, elapsed
-  time, distance traveled, safety flags).
-* **Output:** Boolean exploration-complete signal.
-* **Logic:** OR of configured stop conditions. See
-  [`exploration.md`](exploration.md) §7 for the full condition list and
-  pseudocode.
-* **Complexity:** O(1) given precomputed state values.
-* **Assumptions:** Each stop-condition input (coverage, time, distance,
-  safety flags) is being correctly tracked by the Exploration Manager
-  throughout the run.
-* **Limitations:** Coverage-based stopping assumes the map's total
-  explorable area is knowable/estimable; in an unbounded or very large
-  world this criterion may never trigger on its own, which is why multiple
-  independent stop conditions are recommended.
-* **Future improvements:** Confidence-weighted coverage (accounting for
-  map cells with low observation confidence); adaptive stop thresholds
-  based on diminishing returns in coverage growth rate.
+## 7. Frontier Clustering (`extract_frontier_clusters`)
+
+* **Input:** Frontier mask.
+* **Output:** Clusters with `centroid`, `target` (cluster cell nearest the
+  centroid), `size`, and `gain` = size × resolution (frontier length in m).
+* **Logic:** 8-connected BFS flood fill (the same connectivity as
+  detection); drop clusters below 5 cells.
+* **Complexity:** $O(F)$.
+* **Limitations:** Long L-shaped frontiers become one cluster whose target
+  may sit far from most of its cells.
+* **Tests:** `test_frontier_extraction_uses_8_neighbourhood`.
+
+## 8. Utility with Information-Gain Discount (`frontier_utility`, `sensing_discount`)
+
+* **Logic:**
+
+$$U_i(f) = \alpha \cdot \text{IG}(f) \cdot \prod_k \min\!\left(1, \tfrac{\lVert f - q_k \rVert}{r_s}\right) - \beta \cdot \lVert p_i - f \rVert$$
+
+  with $q_k$ every other drone's position and locked target, $r_s = 5$ m,
+  $\alpha = \beta = 1$. The discount follows Burgard et al. (IEEE T-RO 2005).
+* **Complexity:** $O(K)$ per (drone, frontier) pair.
+* **Limitations:** IG is frontier length, not a ray-cast estimate of
+  visible unknown area; the distance is Euclidean, not path length.
+* **Tests:** `test_utility_trades_gain_against_distance`, `test_sensing_discount_spreads_the_swarm`.
+
+## 9. Algorithm 1: Greedy No-Overlap Assignment (`greedy_assign`)
+
+* **Input:** Drone positions, drones needing a target, clusters, locks held
+  by other drones, blacklist.
+* **Output:** `{ns: (x, y)}` assignments.
+* **Logic:** Drop candidates within 1.0 m of a blacklisted point. Repeat:
+  over all (drone, frontier) pairs, reject $f$ within 2.0 m of another
+  drone or another drone's lock; pick the globally best $U_i(f)$; assign
+  it, lock it, and drop candidates within 2.0 m of it.
+* **Complexity:** $O(K^3 \cdot C)$ in the worst case. That is trivial for $K = 3$.
+* **Limitations:** Greedy and one step ahead; it does not sequence several
+  frontiers per drone.
+* **Tests:** `test_algorithm_1_greedy_no_overlap`, `test_algorithm_1_rejects_frontiers_near_other_drones_and_locks`.
+
+## 10. Target Management (`task_allocator`, 1 Hz)
+
+* **Logic:** Drones below 1.0 m are not tasked. Release the lock on arrival
+  ($\le 0.8$ m). Blacklist the target after 20 s without getting 0.5 m
+  closer. Keep a target for at least 5 s, then release it once no
+  cluster target lies within 2.0 m of it. Publish `/{ns}/cmd_pose` at
+  $z = 1.5$ m.
+* **Termination:** No valid cluster and no active target → log
+  **EXPLORATION COMPLETE**; the drones hold position. Exploration resumes if
+  frontiers reappear. There are no coverage, time or distance stop
+  conditions.
+
+## 11. A* Path Planning (`plan_path`)
+
+* **Input:** Fused grid, start, goal.
+* **Output:** Smoothed waypoint list, or `None`.
+* **Logic:** Inflate cells $\ge 65$ by 0.5 m (impassable); unknown cells
+  cost 2×; 8-connected moves (cost 1 or $\sqrt 2$ times cell cost),
+  Euclidean heuristic. Snap the start to free space within 1.0 m and the
+  goal within 1.5 m. Then line-of-sight smoothing, with segments checked
+  every quarter cell.
+* **Complexity:** $O(N \log N)$ for $N = W \cdot H$ cells; inflation
+  $O(W \cdot H \cdot r^2)$ for radius $r$ cells.
+* **Tests:** `test_astar_avoids_inflated_wall`.
+
+## 12. Path Following and Separation (`flight_controller`, 20 Hz)
+
+* **Logic:** Pure pursuit with a 0.8 m lookahead. Speed
+  $\min(0.8,\ 0.8\, d_{\text{goal}} + 0.15)\cdot\max(0,\cos e_\psi)^2$.
+  Yaw rate $1.5\, e_\psi$ clipped to ±0.8 rad/s. Altitude
+  $v_z = 1.2(1.5 - z)$ clipped to ±0.6 m/s. Inside 1.5 m of another drone
+  add a repulsion $(1.5 - d)/1.5$ m/s away from it, then cap the speed at
+  0.8 m/s. Hold position after 2 s without `cmd_pose`. Output is a
+  body-frame twist on `/{ns}/cmd_vel` for Gazebo's
+  `MulticopterVelocityControl`.
+* **Complexity:** $O(K)$ per tick.
+* **Limitations:** Separation is purely reactive and planning ignores
+  teammates, so two drones can momentarily push each other off their paths.
+  The flight stack is Gazebo's velocity controller, not PX4.
+
+## Earlier Implementations
+
+The C++ packages in `src/mapping` and `src/exploration` implement the
+earlier single-drone, PX4-SITL version of mapping and frontier selection.
+They are not built by the current launcher and are not described here.

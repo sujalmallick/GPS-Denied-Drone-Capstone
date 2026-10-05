@@ -41,7 +41,8 @@ VNC_PASSWORD=mysecret bash docker/sim/run_docker.sh
 ```
 
 Arguments of the form `name:=value` go to `gazebo_swarm.launch.py`. The available arguments are
-`world`, `headless`, `rviz`, `sensor_profile` (`realtime` or `full`), `lock_radius` and `altitude`.
+`world`, `headless`, `rviz`, `sensor_profile` (`realtime` or `full`), `rgb_bridge`, `lock_radius`
+and `altitude`.
 Passing any argument replaces the default `rviz:=true`. `sensor_profile:=full` is still added
 unless you give a different profile. For example:
 

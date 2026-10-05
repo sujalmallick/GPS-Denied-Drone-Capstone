@@ -2,7 +2,14 @@
 
 This guide establishes the exact division of responsibilities for our **3-person Capstone team**:
 **Project**: Multi-Drone Swarm System for Indoor Exploration in GPS-Denied Environments  
-**Primary Simulation Engine**: **Gazebo Harmonic (`gz sim`) + PX4 SITL + ROS 2 Humble** (Running 3 Drones Concurrently).
+**Primary Simulation Engine**: **Gazebo Harmonic (`gz sim`) + ROS 2 Jazzy** (Running 3 Drones Concurrently).
+
+> **Status (Oct 2026):** the running stack flies the drones with Gazebo's `MulticopterVelocityControl`
+> and uses Gazebo odometry as pose; mapping and the local planner are the Python nodes in `coordination/`.
+> The PX4 SITL / MAVROS / stereo-IR VSLAM tasks below are still planned work. The world is
+> `simple_world.sdf` (not a Curved Gridroom), and the drone model has depth, RGB and IMU sensors but no
+> stereo IR pair yet. See [mdFiles/development-roadmap.md](mdFiles/development-roadmap.md) for current status.
+> Code lives in https://github.com/sujalmallick/GPS-Denied-Drone-Capstone.
 
 ---
 
@@ -51,7 +58,7 @@ To guarantee **zero merge conflicts when opening Pull Requests**, each person ha
 - **Owned Folders**: `vslam/`, `src/control/`, `src/localization/`, `src/mapping/`
 - **Core Tasks for Gazebo**:
   1. Configure `ros_gz_bridge` to bridge Gazebo camera streams and IMU to ROS 2 topics (`/{ns}/camera/infra1`, `/{ns}/camera/infra2`, `/{ns}/camera/imu`).
-  2. Setup Visual SLAM / VIO tracking in ROS 2 Humble to output estimated drone odometry.
+  2. Setup Visual SLAM / VIO tracking in ROS 2 Jazzy to output estimated drone odometry.
   3. Configure MAVROS bridge (`vslam/mavrospy.launch.py`) with 3 namespaces forwarding visual pose to PX4 `/mavros/vision_pose/pose`.
   4. Set PX4 EKF2 parameters for vision-only flight (disable GPS and baro drift: `EKF2_HGT_REF=Vision`, `EKF2_GPS_CTRL=0`).
   5. Generate local 2D occupancy grid `/{ns}/map` via depth camera raycasting (feeds into Lead's map merger).
