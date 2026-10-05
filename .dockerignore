@@ -1,0 +1,11 @@
+# Docker build context for docker/sim/Dockerfile (built from the repository root)
+.git/
+build/
+install/
+log/
+validation/output/*.csv
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.vscode/
+.idea/

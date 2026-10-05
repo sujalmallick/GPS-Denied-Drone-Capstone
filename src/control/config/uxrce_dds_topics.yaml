@@ -1,0 +1,89 @@
+/**
+ * uXRCE-DDS Agent Configuration for PX4 SITL
+ * 
+ * This file configures the uXRCE-DDS agent to bridge PX4 SITL topics to ROS 2.
+ * It defines which PX4 topics are exposed to ROS 2 and their message type mappings.
+ * 
+ * VERSION-DEPENDENT: The exact configuration depends on the uXRCE-DDS agent version
+ * and the PX4 release. This is a template for PX4 main branch with Humble ROS 2.
+ * 
+ * Reference: https://docs.px4.io/main/en/middleware/uxrce_dds.html
+ */
+
+/* 
+ * Profile: Middleware Configuration
+ * Defines how the agent communicates with PX4 SITL (typically UDP)
+ */
+<profiles>
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>1</transport_id>
+      <type>UDP</type>
+      <interfaceIPAddress>127.0.0.1</interfaceIPAddress>
+      <port>2019</port>
+    </transport_descriptor>
+  </transport_descriptors>
+</profiles>
+
+/*
+ * Participant Configuration
+ * Defines the DDS participant and DDS domain ID
+ */
+<participant profile_name="default_xrce_dds_profile" domain_id="0">
+  <rtps>
+    <useBuiltinTransports>false</useBuiltinTransports>
+    <transport>
+      <TransportId>1</TransportId>
+    </transport>
+  </rtps>
+</participant>
+
+/*
+ * M2: Topic Definitions for Basic PX4 Communication
+ * 
+ * These topics bridge core PX4 vehicle state to ROS 2 for M2 testing.
+ * M3+ will add sensor topics (image, depth, etc.).
+ * 
+ * FORMAT: <topic_name> : <DDS type> -> <ROS 2 name>
+ */
+
+/* Vehicle Status - core state machine topic */
+<topic>
+  <name>rt/fmu/vehicle_status/out</name>
+  <dataType>px4_msgs::msg::dds_::VehicleStatus_</dataType>
+  <ros2Name>fmu/vehicle_status/out</ros2Name>
+</topic>
+
+/* Vehicle Control Mode - armed/offboard state */
+<topic>
+  <name>rt/fmu/vehicle_control_mode/out</name>
+  <dataType>px4_msgs::msg::dds_::VehicleControlMode_</dataType>
+  <ros2Name>fmu/vehicle_control_mode/out</ros2Name>
+</topic>
+
+/* Sensor Combined - IMU and other sensor data */
+<topic>
+  <name>rt/fmu/sensor_combined/out</name>
+  <dataType>px4_msgs::msg::dds_::SensorCombined_</dataType>
+  <ros2Name>fmu/sensor_combined/out</ros2Name>
+</topic>
+
+/* Vehicle Command - ROS 2 input to PX4 (arm/disarm/etc) */
+<topic>
+  <name>rt/fmu/vehicle_command/in</name>
+  <dataType>px4_msgs::msg::dds_::VehicleCommand_</dataType>
+  <ros2Name>fmu/vehicle_command/in</ros2Name>
+</topic>
+
+/* 
+ * M2 Acceptance: These four topics are sufficient to:
+ * 1. Receive PX4 vehicle status via ROS 2 (vehicle_status/out)
+ * 2. Monitor control mode (vehicle_control_mode/out)
+ * 3. Observe IMU data (sensor_combined/out)
+ * 4. Send arm/disarm commands (vehicle_command/in)
+ * 
+ * M3+ will add:
+ * - Camera image topic (sensor_camera/out)
+ * - Depth sensor topic (sensor_optical_flow/out or custom)
+ * - Ground truth pose topic (vehicle_odometry/out)
+ */
